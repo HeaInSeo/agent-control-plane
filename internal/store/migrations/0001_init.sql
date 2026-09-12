@@ -159,6 +159,16 @@ BEGIN
     SELECT RAISE(ABORT, 'forbidden packet status transition');
 END;
 
+-- Deletion would defeat the immutability trigger above: a packet that no task
+-- references yet could be dropped and re-inserted under the same packet_id
+-- with a widened scope, which is a content change by another route. An
+-- approved packet is a durable record of what was authorised, so it stays.
+CREATE TRIGGER trg_execution_packet_no_delete
+BEFORE DELETE ON execution_packet
+BEGIN
+    SELECT RAISE(ABORT, 'approved packets are immutable and cannot be deleted');
+END;
+
 -- ---------------------------------------------------------------------------
 -- TaskRun (CC6): the durable scheduling subject.
 -- ---------------------------------------------------------------------------
@@ -200,6 +210,24 @@ BEGIN
 END;
 
 -- Completion evidence must be evidence about this very task.
+--
+-- Guarded on INSERT as well as UPDATE. SQLite has no BEFORE INSERT OR UPDATE,
+-- so each rule is written twice. The INSERT form is not redundant: today
+-- CreateTaskRun hardcodes NULL for both columns, but nothing in the schema
+-- would stop a future code path from inserting a task that is already
+-- COMPLETED against another task's evidence, or that points at another
+-- task's attempt. Both foreign keys would resolve; only ownership would be
+-- wrong, and this file's premise is that the schema does not rely on code
+-- remembering to check.
+CREATE TRIGGER trg_task_run_completion_evidence_binding_ins
+BEFORE INSERT ON task_run
+FOR EACH ROW
+WHEN NEW.completed_evidence_id IS NOT NULL
+  AND (SELECT task_id FROM evidence_observation WHERE evidence_id = NEW.completed_evidence_id) IS NOT NEW.task_id
+BEGIN
+    SELECT RAISE(ABORT, 'completion evidence must be attributed to this task');
+END;
+
 CREATE TRIGGER trg_task_run_completion_evidence_binding
 BEFORE UPDATE ON task_run
 FOR EACH ROW
@@ -210,6 +238,15 @@ BEGIN
 END;
 
 -- A task may only point at an attempt that belongs to it.
+CREATE TRIGGER trg_task_run_current_attempt_binding_ins
+BEFORE INSERT ON task_run
+FOR EACH ROW
+WHEN NEW.current_attempt_id IS NOT NULL
+  AND (SELECT task_id FROM worker_attempt WHERE attempt_id = NEW.current_attempt_id) IS NOT NEW.task_id
+BEGIN
+    SELECT RAISE(ABORT, 'current_attempt_id must belong to this task');
+END;
+
 CREATE TRIGGER trg_task_run_current_attempt_binding
 BEFORE UPDATE ON task_run
 FOR EACH ROW
@@ -401,6 +438,31 @@ WHEN (SELECT task_id FROM worker_attempt WHERE attempt_id = NEW.attempt_id) IS N
   OR (SELECT base_sha FROM workspace WHERE workspace_id = NEW.workspace_id) IS NOT NEW.base_sha
 BEGIN
     SELECT RAISE(ABORT, 'publish_attempt binding must match its attempt and workspace');
+END;
+
+-- Permitted publication status transitions only. A REJECTED or OBSERVED
+-- outcome is final, and nothing returns to PENDING, so a publication recorded
+-- as rejected cannot be flipped to APPLIED and then used to complete a task.
+--
+-- PENDING   -> APPLIED | OBSERVED | REJECTED | UNKNOWN
+-- APPLIED   -> OBSERVED | UNKNOWN
+-- UNKNOWN   -> APPLIED | OBSERVED | REJECTED
+-- OBSERVED, REJECTED are terminal.
+--
+-- PENDING -> OBSERVED is permitted because a publisher can crash after the
+-- remote mutation lands but before recording APPLIED; later reconciliation
+-- then observes the effect directly.
+CREATE TRIGGER trg_publish_attempt_status_transition
+BEFORE UPDATE OF status ON publish_attempt
+FOR EACH ROW
+WHEN NEW.status IS NOT OLD.status
+ AND NOT (
+        (OLD.status = 'PENDING' AND NEW.status IN ('APPLIED', 'OBSERVED', 'REJECTED', 'UNKNOWN'))
+     OR (OLD.status = 'APPLIED' AND NEW.status IN ('OBSERVED', 'UNKNOWN'))
+     OR (OLD.status = 'UNKNOWN' AND NEW.status IN ('APPLIED', 'OBSERVED', 'REJECTED'))
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'forbidden publish status transition');
 END;
 
 CREATE TRIGGER trg_publish_attempt_identity_immutable

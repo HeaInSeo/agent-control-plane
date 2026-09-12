@@ -72,8 +72,9 @@ Defences in M0:
 - `source_commit_sha` must be a full 40-hex commit name. A branch name, a
   symbolic ref or an abbreviation cannot be stored.
 - `target_ref` must be a fully qualified, non-symbolic `refs/...` name.
-- The `idempotency_key` is derived from the whole intent, so a retry is the
-  same publication and a different intent cannot reuse an existing identity.
+- The `idempotency_key` is derived from the whole intent, and the store always
+  recomputes it rather than trusting a supplied value, so a retry is the same
+  publication and no caller can mint a second identity for one intent.
 - A publication may only be recorded under the current scheduler epoch.
 - Only a `MODIFYING` attempt may record a publication.
 - `domain.CheckPublishPreconditions` re-checks the binding against live state,
@@ -98,6 +99,12 @@ Defences in M0:
   and a trigger requires that evidence to be attributed to that very task.
 - Evidence must match the attempt on all of task, attempt, scheduler epoch,
   fence epoch, repository subject and workspace.
+- Completion requires the evidence to come from the task's current,
+  non-terminal attempt with an unreleased workspace, so a fenced-out attempt
+  cannot complete a task a successor is still running.
+- A publication that was recorded `REJECTED` cannot be flipped back to
+  `APPLIED` and then used to complete a task; `OBSERVED` and `REJECTED` are
+  terminal and nothing returns to `PENDING`.
 - The default effect rule is exact SHA equality, not ancestor-or-equal.
 - For modifying work, completion additionally requires a publication binding
   whose status is `APPLIED` or `OBSERVED`.
@@ -203,6 +210,12 @@ Event fields are redacted on append by key-name matching over token, secret,
 password, credential, authorization, bearer, cookie, private key, API key,
 access key, session key, SSH key, signature and PAT fragments.
 
+Values are normalised through JSON before redaction, so redaction always runs
+on exactly the shape that will be stored. Without that step a Go struct would
+pass through untouched and then be marshalled with its json-tagged credential
+field intact — the key-name check never saw the key, because in Go it was a
+field name rather than a map key.
+
 Redaction descends through every container, not only maps: a sensitive key
 nested inside a list, inside a list of lists, or inside a typed Go slice of
 maps is redacted too, so a shape like
@@ -215,6 +228,14 @@ cannot reach durable history with its credential intact. A sensitive key whose
 value is itself a container has the whole value replaced rather than being
 descended into. Redaction happens inside the store, so a caller that passes a
 credential cannot get it into durable history.
+
+Short sensitive tokens are matched as whole words rather than substrings.
+`pat` occurs inside path, patch, compat, pattern and dispatch, and because
+redaction runs inside `AppendEvent` on an append-only table, a substring match
+there would permanently destroy ordinary operational data — the workspace path
+of every attempt, for one — from the history this control plane exists to
+preserve. Recursion is depth-bounded, and a self-referential value is a clean
+error rather than a crash.
 
 This is defence in depth, not a licence to pass secrets: key-name matching
 cannot catch a credential stored under an innocuous name, one embedded in a

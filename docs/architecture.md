@@ -113,6 +113,11 @@ that can run arbitrary local Git. The schema holds one workspace per attempt
 (`UNIQUE(attempt_id)`), one attempt per directory (`UNIQUE(root_path)`), and an
 immutable owner, so a workspace cannot be shared or rebound.
 
+`root_path` must be absolute and already canonical. Uniqueness of a string is
+not uniqueness of a directory: `/a/ws`, `/a/ws/`, `/a/./ws`, `/a/b/../ws` and a
+relative `ws` are five distinct strings naming at most one directory, so
+without canonicalisation the constraint would not mean what it says.
+
 ### CC4 — SchedulerEpoch
 
 `ActivateScheduler` is the only path that inserts an epoch. `Open`,
@@ -147,6 +152,13 @@ rejected as a default: an unrelated human commit advancing a ref would satisfy
 it while the approved effect is no longer the state of the ref. A future effect
 that legitimately transforms commits — a merge-generated commit, say — needs
 its own explicit evidence contract with provenance, not a loosened default.
+
+Completion additionally requires that the evidence come from the attempt that
+currently owns the task, that the attempt is not terminal, and that its
+workspace has not been released. Without those checks a fenced-out attempt's
+evidence would complete a task a successor was still actively running — the
+publication path already revalidated all three, and completion was the
+asymmetric hole.
 
 Read-only work has its own evidence contract, because it publishes nothing.
 A `READ_ONLY_REVIEW` observation must bind `reviewed_sha` — the fixed commit
@@ -192,7 +204,26 @@ Nothing returns to `APPROVED`. Reviving a packet whose binding was already
 found not to hold would re-authorise an execution that was stopped for cause;
 a new approval is a new packet. Both the Go guard
 (`state.PacketStatus.CanTransitionTo`, checked in `SetPacketStatus`) and a
-schema trigger enforce this.
+schema trigger enforce this. Deletion is refused too: a packet no task
+references yet could otherwise be dropped and re-inserted under the same
+identity with a widened scope, which is a content change by another route.
+
+`PublishStatus` has the same shape of rule, because a publication recorded
+`REJECTED` that could be flipped to `APPLIED` would be usable to complete a
+task:
+
+```text
+PENDING  -> APPLIED | OBSERVED | REJECTED | UNKNOWN
+APPLIED  -> OBSERVED | UNKNOWN
+UNKNOWN  -> APPLIED | OBSERVED | REJECTED
+OBSERVED, REJECTED are terminal
+```
+
+`PENDING -> OBSERVED` is permitted because a publisher can crash after the
+remote mutation lands but before recording `APPLIED`, and later reconciliation
+then observes the effect directly. `UNKNOWN` is the one state still open to
+resolution — it means the outcome could not be determined, not that it
+succeeded, and it never completes a task.
 
 ### CC9 — lane-agnostic modifying admission
 
@@ -216,14 +247,27 @@ transaction.
 
 ## SQLite backend
 
-WAL, `foreign_keys = ON` per connection, `synchronous = FULL`, a single
-connection matching the single-active-scheduler model, and `BEGIN IMMEDIATE`
-via `_txlock=immediate`.
+WAL, a single connection matching the single-active-scheduler model, and
+`BEGIN IMMEDIATE` via `_txlock=immediate`.
+
+Per-connection pragmas — `foreign_keys`, `synchronous = FULL`, and
+`query_only` on read-only handles — are carried in the DSN, not applied once
+to the pool. `database/sql` may discard and re-establish its connection at any
+time, and a replacement gets only what the DSN carries; a pragma applied once
+would silently vanish, taking with it the enforcement of every identity
+relation in the schema. `VerifyConnectionPragmas` asserts they are actually in
+force rather than assuming it. `journal_mode` is a property of the database
+file rather than of the connection, so it is set once.
 
 Open fails closed on: a missing file without explicit `AllowCreate`; a
 read-only handle asked to create; a file that is not SQLite; a SQLite file
 without this control plane's `db_kind` marker; a failed integrity check. A
 corrupt or unexpected database is never silently replaced with a fresh one.
+
+A zero-length file counts as absent for those gates. It is what SQLite leaves
+before its first write, but also what a typo or an abandoned run leaves, and
+treating it as an existing database would let a mistyped path silently yield a
+fresh, empty control plane — the exact case `AllowCreate` exists to prevent.
 
 Migrations are embedded, forward-only and contiguous from version 1, each
 recorded with a SHA-256 checksum. Replay is idempotent and doubles as a

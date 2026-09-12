@@ -36,6 +36,14 @@ func (t *Tx) ObserveRepositorySubject(ctx context.Context, subject domain.Reposi
 		if existing.CurrentFullName == subject.CurrentFullName {
 			return existing, nil
 		}
+		// An observation older than what is already recorded is ignored. A
+		// retried or queued reconciliation carrying a pre-rename snapshot
+		// would otherwise revert the alias, write a backwards rename into
+		// append-only history, and — because aliases are not unique — could
+		// make a legitimate alias lookup start failing as ambiguous.
+		if subject.ObservedAt.Before(existing.ObservedAt) {
+			return existing, nil
+		}
 		if _, err := t.tx.ExecContext(ctx,
 			`UPDATE repository_subject SET current_full_name = ?, observed_at = ? WHERE github_node_id = ?`,
 			subject.CurrentFullName, formatTime(subject.ObservedAt), subject.GitHubNodeID,

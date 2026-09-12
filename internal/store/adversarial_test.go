@@ -237,8 +237,10 @@ func TestForeignOrStaleAttemptCannotReusePublishIdentity(t *testing.T) {
 		err := db.Write(ctx, func(tx *store.Tx) error {
 			return tx.RecordPublishAttempt(ctx, thief)
 		})
-		if !errors.Is(err, store.ErrDuplicatePublishIdentity) {
-			t.Fatalf("want ErrDuplicatePublishIdentity, got %v", err)
+		// Rejected before it can reach the uniqueness constraint: the key is
+		// the intent, so a key that is not this intent's is not a key.
+		if !errors.Is(err, domain.ErrPublishBindingInvalid) {
+			t.Fatalf("want ErrPublishBindingInvalid, got %v", err)
 		}
 	})
 

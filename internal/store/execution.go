@@ -145,9 +145,33 @@ func (t *Tx) CompleteTaskRunFromEvidence(ctx context.Context, taskID ids.TaskID,
 	if err != nil {
 		return err
 	}
+	if attempt.TaskID != run.TaskID {
+		return fmt.Errorf("%w: evidence attempt belongs to task %s, not %s",
+			ErrCompletionNotDerivable, string(attempt.TaskID), string(run.TaskID))
+	}
+	// The evidence must come from the attempt that currently owns the task.
+	// Without this, a fenced-out attempt's evidence completes a task that a
+	// successor is still actively running — the publication path already
+	// revalidates both of these, and completion was the asymmetric hole.
+	if run.CurrentAttemptID == nil || *run.CurrentAttemptID != attempt.AttemptID {
+		current := "none"
+		if run.CurrentAttemptID != nil {
+			current = string(*run.CurrentAttemptID)
+		}
+		return fmt.Errorf("%w: task %s current attempt is %s, evidence is from %s",
+			ErrCompletionNotDerivable, string(run.TaskID), current, string(attempt.AttemptID))
+	}
+	if attempt.Status.IsTerminal() {
+		return fmt.Errorf("%w: attempt %s is terminal (%s)",
+			ErrCompletionNotDerivable, string(attempt.AttemptID), string(attempt.Status))
+	}
 	workspace, err := t.WorkspaceForAttempt(ctx, attempt.AttemptID)
 	if err != nil {
 		return err
+	}
+	if workspace.ReleasedAt != nil {
+		return fmt.Errorf("%w: workspace %s is released",
+			ErrCompletionNotDerivable, string(workspace.WorkspaceID))
 	}
 
 	publishStatus := state.PublishUnknown
@@ -174,10 +198,6 @@ func (t *Tx) CompleteTaskRunFromEvidence(ctx context.Context, taskID ids.TaskID,
 	})
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrCompletionNotDerivable, err)
-	}
-	if attempt.TaskID != run.TaskID {
-		return fmt.Errorf("%w: evidence attempt belongs to task %s, not %s",
-			ErrCompletionNotDerivable, string(attempt.TaskID), string(run.TaskID))
 	}
 
 	return t.exactlyOne(ctx, "task run", string(taskID),
@@ -307,11 +327,11 @@ func (t *Tx) SetWorkerAttemptStatus(ctx context.Context, id ids.AttemptID, statu
 
 // CreateWorkspace records the workspace owned by one attempt.
 func (t *Tx) CreateWorkspace(ctx context.Context, w domain.Workspace) error {
-	if err := w.Validate(); err != nil {
-		return err
-	}
 	if w.CreatedAt.IsZero() {
 		w.CreatedAt = t.Now()
+	}
+	if err := w.Validate(); err != nil {
+		return err
 	}
 	if _, err := t.tx.ExecContext(ctx,
 		`INSERT INTO workspace (workspace_id, attempt_id, task_id, repository_subject_id,

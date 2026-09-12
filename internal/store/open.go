@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver; no cgo, no system libsqlite
@@ -107,11 +108,17 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		return nil, errors.New("store: Config.Path is required")
 	}
 
-	existed, err := inspectFile(cfg.Path)
+	state, err := inspectFile(cfg.Path)
 	if err != nil {
 		return nil, err
 	}
-	if !existed {
+	// A zero-length file holds no database. It is what SQLite itself leaves
+	// behind before its first write, and it is also what a stray `touch` or an
+	// abandoned path leaves behind — so for the purpose of the create gates it
+	// counts as absent. Treating it as existing would let a mistyped path
+	// silently yield a fresh, empty control plane, which is the exact case
+	// AllowCreate exists to prevent.
+	if !state.holdsDatabase() {
 		if cfg.Mode == ModeReadOnly {
 			return nil, fmt.Errorf("%w: %s (read-only open cannot create)", ErrDatabaseNotFound, cfg.Path)
 		}
@@ -141,7 +148,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		_ = sqlDB.Close()
 		return nil, err
 	}
-	if existed {
+	if state.holdsDatabase() {
 		if err := db.verifyOwnMarker(ctx); err != nil {
 			_ = sqlDB.Close()
 			return nil, err
@@ -151,37 +158,54 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 }
 
 // dsn builds the driver connection string.
+//
+// Every per-connection pragma goes in the DSN, not into a one-off Exec on the
+// pool. foreign_keys, synchronous and query_only are connection state, and
+// database/sql may discard and re-establish the pooled connection at any time
+// (a driver.ErrBadConn, a failed session reset). A replacement connection gets
+// only what the DSN carries, so a pragma applied once to the pool can silently
+// disappear — and with it the enforcement of every identity relation in the
+// schema, all of which are foreign keys.
+//
+// The driver applies each `_pragma` query parameter on every connection it
+// opens, so the query string is built by hand: url.Values.Encode would
+// collapse the repeated `_pragma` key.
 func dsn(cfg Config) string {
-	q := url.Values{}
-	// _txlock=immediate takes the write lock at BEGIN, so a read-then-write
-	// transaction cannot fail late with a lock upgrade error.
-	q.Set("_txlock", "immediate")
-	q.Set("_pragma", fmt.Sprintf("busy_timeout(%d)", cfg.BusyTimeout.Milliseconds()))
-	if cfg.Mode == ModeReadOnly {
-		q.Set("mode", "ro")
+	pragmas := []string{
+		fmt.Sprintf("busy_timeout(%d)", cfg.BusyTimeout.Milliseconds()),
+		// Load-bearing: the schema expresses identity relations as foreign
+		// keys, and SQLite leaves enforcement off per connection by default.
+		"foreign_keys(1)",
 	}
-	// url.Values.Encode sorts keys and would collapse repeated _pragma values,
-	// so pragmas that must all be present are applied in configure() instead.
-	return "file:" + cfg.Path + "?" + q.Encode()
+
+	params := []string{
+		// _txlock=immediate takes the write lock at BEGIN, so a read-then-write
+		// transaction cannot fail late with a lock upgrade error.
+		"_txlock=immediate",
+	}
+	if cfg.Mode == ModeReadOnly {
+		params = append(params, "mode=ro")
+		pragmas = append(pragmas, "query_only(1)")
+	} else {
+		pragmas = append(pragmas, "synchronous(FULL)")
+	}
+	for _, pragma := range pragmas {
+		params = append(params, "_pragma="+url.QueryEscape(pragma))
+	}
+
+	// journal_mode is a property of the database file rather than of the
+	// connection, so it is set once in configure() instead of on every
+	// connection, and a replaced connection cannot lose it.
+	return (&url.URL{Scheme: "file", Path: cfg.Path}).String() + "?" + strings.Join(params, "&")
 }
 
-// configure applies connection pragmas and verifies the file is usable.
+// configure sets the database-level journal mode, verifies that the
+// connection pragmas the DSN asked for actually took effect, and checks the
+// file is usable.
 func (db *DB) configure(ctx context.Context, cfg Config) error {
-	// foreign_keys is per-connection and off by default in SQLite. Every
-	// identity relation in this schema is a foreign key, so this is
-	// load-bearing rather than hygiene.
-	if _, err := db.sql.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
-		return fmt.Errorf("store: enable foreign keys: %w", err)
-	}
-	var fk int
-	if err := db.sql.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&fk); err != nil {
-		return fmt.Errorf("store: read foreign_keys pragma: %w", err)
-	}
-	if fk != 1 {
-		return errors.New("store: foreign key enforcement could not be enabled")
-	}
-
 	if db.mode == ModeReadWrite {
+		// journal_mode is stored in the database file, so it is set once here
+		// rather than per connection.
 		var journal string
 		if err := db.sql.QueryRowContext(ctx, "PRAGMA journal_mode = WAL").Scan(&journal); err != nil {
 			return fmt.Errorf("store: enable WAL: %w", err)
@@ -189,19 +213,51 @@ func (db *DB) configure(ctx context.Context, cfg Config) error {
 		if journal != "wal" {
 			return fmt.Errorf("store: journal_mode is %q, want wal", journal)
 		}
-		if _, err := db.sql.ExecContext(ctx, "PRAGMA synchronous = FULL"); err != nil {
-			return fmt.Errorf("store: set synchronous: %w", err)
-		}
-	} else {
-		if _, err := db.sql.ExecContext(ctx, "PRAGMA query_only = ON"); err != nil {
-			return fmt.Errorf("store: set query_only: %w", err)
-		}
 	}
-
+	if err := db.VerifyConnectionPragmas(ctx); err != nil {
+		return err
+	}
 	if !cfg.SkipIntegrityCheck {
 		if err := db.IntegrityCheck(ctx); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// VerifyConnectionPragmas checks that the per-connection settings the DSN
+// requested are in force on the connection actually serving queries.
+//
+// This is worth asserting rather than assuming: a silently missing
+// foreign_keys pragma would not fail anything loudly, it would just stop
+// enforcing every identity relation in the schema.
+func (db *DB) VerifyConnectionPragmas(ctx context.Context) error {
+	var fk int
+	if err := db.sql.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&fk); err != nil {
+		return fmt.Errorf("store: read foreign_keys pragma: %w", err)
+	}
+	if fk != 1 {
+		return errors.New("store: foreign key enforcement is not enabled on this connection")
+	}
+
+	if db.mode == ModeReadOnly {
+		var queryOnly int
+		if err := db.sql.QueryRowContext(ctx, "PRAGMA query_only").Scan(&queryOnly); err != nil {
+			return fmt.Errorf("store: read query_only pragma: %w", err)
+		}
+		if queryOnly != 1 {
+			return errors.New("store: query_only is not enabled on this read-only connection")
+		}
+		return nil
+	}
+
+	var synchronous int
+	if err := db.sql.QueryRowContext(ctx, "PRAGMA synchronous").Scan(&synchronous); err != nil {
+		return fmt.Errorf("store: read synchronous pragma: %w", err)
+	}
+	// 2 == FULL.
+	if synchronous != 2 {
+		return fmt.Errorf("store: synchronous is %d, want 2 (FULL)", synchronous)
 	}
 	return nil
 }
@@ -271,37 +327,51 @@ func (db *DB) verifyOwnMarker(ctx context.Context) error {
 	return nil
 }
 
-// inspectFile reports whether the database file already exists, rejecting
-// anything that exists but cannot be a SQLite database.
-func inspectFile(path string) (bool, error) {
+// fileState describes what is at the database path before opening it.
+type fileState int
+
+const (
+	// fileAbsent means nothing is at the path.
+	fileAbsent fileState = iota
+	// fileEmpty means a zero-length file is at the path. It holds no
+	// database, so it is not a database to be opened.
+	fileEmpty
+	// fileDatabase means a file with a valid SQLite header is at the path.
+	fileDatabase
+)
+
+// holdsDatabase reports whether the path actually holds a database.
+func (s fileState) holdsDatabase() bool { return s == fileDatabase }
+
+// inspectFile reports what is at the database path, rejecting anything that
+// exists and is not a SQLite database.
+func inspectFile(path string) (fileState, error) {
 	info, err := os.Stat(path)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
-		return false, nil
+		return fileAbsent, nil
 	case err != nil:
-		return false, fmt.Errorf("store: stat database: %w", err)
+		return fileAbsent, fmt.Errorf("store: stat database: %w", err)
 	case info.IsDir():
-		return false, fmt.Errorf("%w: %s is a directory", ErrNotSQLiteDatabase, path)
+		return fileAbsent, fmt.Errorf("%w: %s is a directory", ErrNotSQLiteDatabase, path)
 	case info.Size() == 0:
-		// A zero-length file is what SQLite itself produces before the first
-		// write, so it is a legitimate pre-creation state.
-		return true, nil
+		return fileEmpty, nil
 	}
 
 	f, err := os.Open(path)
 	if err != nil {
-		return false, fmt.Errorf("store: open database for header check: %w", err)
+		return fileAbsent, fmt.Errorf("store: open database for header check: %w", err)
 	}
 	defer f.Close()
 
 	header := make([]byte, len(sqliteMagic))
 	if _, err := f.Read(header); err != nil {
-		return false, fmt.Errorf("%w: %s: %w", ErrNotSQLiteDatabase, path, err)
+		return fileAbsent, fmt.Errorf("%w: %s: %w", ErrNotSQLiteDatabase, path, err)
 	}
 	if string(header) != sqliteMagic {
-		return false, fmt.Errorf("%w: %s has an unexpected file header", ErrNotSQLiteDatabase, path)
+		return fileAbsent, fmt.Errorf("%w: %s has an unexpected file header", ErrNotSQLiteDatabase, path)
 	}
-	return true, nil
+	return fileDatabase, nil
 }
 
 // Mode reports the handle's access mode.

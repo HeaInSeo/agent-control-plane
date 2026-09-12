@@ -3,6 +3,7 @@ package domain
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"github.com/HeaInSeo/agent-control-plane/internal/ids"
@@ -226,6 +227,26 @@ func (k IsolationKind) Validate() error {
 	}
 }
 
+// validateWorkspacePath requires an absolute, already-canonical path.
+//
+// The schema's UNIQUE(root_path) is the filesystem half of the isolation
+// invariant, but uniqueness of a string is not uniqueness of a directory:
+// "/a/ws", "/a/ws/", "/a/./ws", "/a/b/../ws" and a relative "ws" are five
+// distinct strings naming at most one directory. Requiring a canonical
+// absolute form is what makes the constraint mean what CC3 says it means.
+func validateWorkspacePath(path string) error {
+	if path == "" {
+		return fmt.Errorf("%w: root_path is empty", ErrInvalidEntity)
+	}
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("%w: root_path %q must be absolute", ErrInvalidEntity, path)
+	}
+	if cleaned := filepath.Clean(path); cleaned != path {
+		return fmt.Errorf("%w: root_path %q is not canonical (want %q)", ErrInvalidEntity, path, cleaned)
+	}
+	return nil
+}
+
 // Workspace is the filesystem identity owned by exactly one WorkerAttempt.
 //
 // The store enforces one workspace per attempt and one attempt per root path,
@@ -263,8 +284,8 @@ func (w Workspace) Validate() error {
 	if err := w.IsolationKind.Validate(); err != nil {
 		return err
 	}
-	if w.RootPath == "" {
-		return fmt.Errorf("%w: root_path is empty", ErrInvalidEntity)
+	if err := validateWorkspacePath(w.RootPath); err != nil {
+		return err
 	}
 	if w.CreatedAt.IsZero() {
 		return fmt.Errorf("%w: created_at is zero", ErrInvalidEntity)

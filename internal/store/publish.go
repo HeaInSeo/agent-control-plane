@@ -27,17 +27,26 @@ var ErrDuplicatePublishIdentity = errors.New("duplicate publish identity")
 // later work. Recording the binding now means the future publisher cannot be
 // written without one.
 func (t *Tx) RecordPublishAttempt(ctx context.Context, p domain.PublishAttempt) error {
-	if p.IdempotencyKey == "" {
-		p.IdempotencyKey = domain.DeriveIdempotencyKey(p)
+	// The idempotency key is the intent, so it is always recomputed here. A
+	// caller-chosen key would defeat the uniqueness constraint entirely: two
+	// keys for one intent are two publication identities, which is exactly
+	// what the constraint exists to prevent. A supplied key is accepted only
+	// if it is the derived one.
+	derived := domain.DeriveIdempotencyKey(p)
+	if p.IdempotencyKey != "" && p.IdempotencyKey != derived {
+		return fmt.Errorf("%w: idempotency_key %q is not derived from this intent (want %q)",
+			domain.ErrPublishBindingInvalid, p.IdempotencyKey, derived)
+	}
+	p.IdempotencyKey = derived
+
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = t.Now()
 	}
 	if err := p.Validate(); err != nil {
 		return err
 	}
 	if err := t.RequireCurrentEpoch(ctx, p.SchedulerEpoch); err != nil {
 		return err
-	}
-	if p.CreatedAt.IsZero() {
-		p.CreatedAt = t.Now()
 	}
 
 	_, err := t.tx.ExecContext(ctx,
@@ -104,10 +113,27 @@ func (t *Tx) PublishAttempt(ctx context.Context, id ids.PublishAttemptID) (domai
 	}, nil
 }
 
+// ErrForbiddenPublishTransition is returned when a publication status change
+// is not a permitted transition.
+var ErrForbiddenPublishTransition = errors.New("forbidden publish status transition")
+
 // SetPublishStatus moves a publication within PublishStatus.
+//
+// Only a permitted transition is accepted. Without this a publication
+// recorded REJECTED could be flipped to APPLIED and then used to complete a
+// task — the same "authority regained" move the packet transitions forbid.
+// The same rule is enforced by a schema trigger.
 func (t *Tx) SetPublishStatus(ctx context.Context, id ids.PublishAttemptID, status state.PublishStatus) error {
 	if err := status.Validate(); err != nil {
 		return err
+	}
+	current, err := t.PublishAttempt(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !current.Status.CanTransitionTo(status) {
+		return fmt.Errorf("%w: publication %s cannot move from %q to %q",
+			ErrForbiddenPublishTransition, string(id), string(current.Status), string(status))
 	}
 	return t.exactlyOne(ctx, "publish attempt", string(id),
 		`UPDATE publish_attempt SET status = ? WHERE publish_attempt_id = ?`,

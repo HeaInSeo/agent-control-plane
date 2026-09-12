@@ -4,9 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/HeaInSeo/agent-control-plane/internal/ids"
 )
@@ -109,11 +109,26 @@ func (e Event) Validate() error {
 }
 
 // sensitiveFragments are substrings that mark a field name as sensitive.
+//
+// Every entry here is long enough that a substring match does not collide
+// with ordinary field names. Short abbreviations belong in
+// sensitiveTokens instead.
 var sensitiveFragments = []string{
 	"token", "secret", "password", "passwd", "credential", "authorization",
 	"bearer", "cookie", "private_key", "privatekey", "api_key", "apikey",
-	"access_key", "session_key", "ssh_key", "signature", "pat",
+	"access_key", "session_key", "ssh_key", "signature",
 }
+
+// sensitiveTokens mark a field name as sensitive only when they appear as a
+// whole word within it.
+//
+// "pat" (personal access token) cannot be substring-matched: it occurs inside
+// path, patch, compat, pattern and dispatch. Because redaction runs inside
+// AppendEvent and the event table is append-only, a substring match there
+// would permanently destroy ordinary operational data — the workspace path of
+// every attempt, for one — from the history this control plane exists to
+// preserve.
+var sensitiveTokens = []string{"pat", "pats"}
 
 // RedactFields returns a copy of in with sensitive values replaced.
 //
@@ -139,103 +154,52 @@ func RedactFields(in map[string]any) map[string]any {
 			out[k] = Redacted
 			continue
 		}
-		out[k] = redactValue(v)
+		out[k] = redactValue(v, 1)
 	}
 	return out
 }
+
+// maxRedactionDepth bounds how deep redaction descends.
+//
+// Field values come from callers, and a self-referential structure would
+// otherwise recurse until the stack gave out — crashing the scheduler inside
+// AppendEvent. At the limit the value is replaced rather than stored: if it
+// cannot be inspected, it is not written.
+const maxRedactionDepth = 64
 
 // redactValue redacts inside an arbitrary field value.
 //
-// The common shapes — the ones JSON decoding produces — are handled directly.
-// Anything else that is still a container is handled reflectively, so a
-// caller passing []map[string]any or map[string][]any from Go code is covered
-// as well as a decoded []any.
-func redactValue(v any) any {
+// Only the shapes JSON decoding produces are handled, because EncodeFields
+// normalises values through JSON before redacting them. That normalisation is
+// what makes this total: a struct, a named map type or a json.Marshaler all
+// arrive here as plain maps, slices and scalars.
+func redactValue(v any, depth int) any {
+	if depth > maxRedactionDepth {
+		return Redacted
+	}
 	switch typed := v.(type) {
-	case nil:
-		return nil
 	case map[string]any:
-		return redactStringKeyedMap(typed)
+		out := make(map[string]any, len(typed))
+		for k, elem := range typed {
+			if isSensitiveKey(k) {
+				out[k] = Redacted
+				continue
+			}
+			out[k] = redactValue(elem, depth+1)
+		}
+		return out
 	case []any:
 		out := make([]any, len(typed))
 		for i, elem := range typed {
-			out[i] = redactValue(elem)
+			out[i] = redactValue(elem, depth+1)
 		}
 		return out
-	case string, bool,
-		int, int8, int16, int32, int64,
-		uint, uint8, uint16, uint32, uint64,
-		float32, float64:
-		// Scalars carry no keys, so there is nothing to match on. A secret
-		// stored under an innocuous key is a documented limitation of
-		// key-name redaction.
-		return v
-	}
-	return redactContainerByReflection(v)
-}
-
-// redactStringKeyedMap redacts a map whose keys are already strings.
-func redactStringKeyedMap(in map[string]any) map[string]any {
-	out := make(map[string]any, len(in))
-	for k, v := range in {
-		if isSensitiveKey(k) {
-			out[k] = Redacted
-			continue
-		}
-		out[k] = redactValue(v)
-	}
-	return out
-}
-
-// redactContainerByReflection handles container shapes the type switch does
-// not name. Non-containers are returned unchanged.
-func redactContainerByReflection(v any) any {
-	rv := reflect.ValueOf(v)
-	switch rv.Kind() {
-	case reflect.Pointer, reflect.Interface:
-		if rv.IsNil() {
-			return v
-		}
-		return redactValue(rv.Elem().Interface())
-
-	case reflect.Slice, reflect.Array:
-		if rv.Kind() == reflect.Slice && rv.IsNil() {
-			return v
-		}
-		out := make([]any, rv.Len())
-		for i := range out {
-			out[i] = redactValue(rv.Index(i).Interface())
-		}
-		return out
-
-	case reflect.Map:
-		if rv.IsNil() {
-			return v
-		}
-		out := make(map[string]any, rv.Len())
-		for _, key := range rv.MapKeys() {
-			// Map keys reach durable history as JSON object names, so they
-			// are stringified the same way here.
-			name := stringifyKey(key)
-			if isSensitiveKey(name) {
-				out[name] = Redacted
-				continue
-			}
-			out[name] = redactValue(rv.MapIndex(key).Interface())
-		}
-		return out
-
 	default:
+		// Scalars carry no keys, so there is nothing to match on. A secret
+		// stored under an innocuous key, or as a bare list element, is a
+		// documented limitation of key-name redaction.
 		return v
 	}
-}
-
-// stringifyKey renders a map key as the name it would carry in JSON.
-func stringifyKey(key reflect.Value) string {
-	if key.Kind() == reflect.String {
-		return key.String()
-	}
-	return fmt.Sprint(key.Interface())
 }
 
 func isSensitiveKey(k string) bool {
@@ -245,12 +209,70 @@ func isSensitiveKey(k string) bool {
 			return true
 		}
 	}
+	for _, word := range keyWords(k) {
+		for _, token := range sensitiveTokens {
+			if word == token {
+				return true
+			}
+		}
+	}
 	return false
 }
 
+// keyWords splits a field name into its lowercased words, so a short
+// sensitive token can be matched as a whole word.
+//
+// Separators and camelCase boundaries both split, so "githubPat",
+// "github_pat", "github.pat" and "GITHUB-PAT" all yield a "pat" word, while
+// "root_path" and "patch" do not. The split runs on the original spelling
+// because lowercasing first would destroy the camelCase boundary.
+func keyWords(key string) []string {
+	var (
+		words   []string
+		current []rune
+	)
+	flush := func() {
+		if len(current) > 0 {
+			words = append(words, strings.ToLower(string(current)))
+			current = current[:0]
+		}
+	}
+	runes := []rune(key)
+	for i, r := range runes {
+		switch {
+		case !unicode.IsLetter(r) && !unicode.IsDigit(r):
+			flush()
+		case unicode.IsUpper(r) && i > 0 && (unicode.IsLower(runes[i-1]) || unicode.IsDigit(runes[i-1])):
+			// lower-to-upper transition: githubPat -> github, Pat
+			flush()
+			current = append(current, r)
+		default:
+			current = append(current, r)
+		}
+	}
+	flush()
+	return words
+}
+
 // EncodeFields serialises event fields for storage, redacting first.
+//
+// Values are normalised through JSON before redaction, so redaction runs on
+// exactly the shape that will be stored. Without that step a struct value
+// would pass through untouched and then be marshalled with its json-tagged
+// credential field intact — key-name redaction never saw the key, because in
+// Go it was a field name rather than a map key. Normalising first also turns
+// a self-referential value into a clean error here instead of a crash deeper
+// in the walk.
 func EncodeFields(in map[string]any) (string, error) {
-	redacted := RedactFields(in)
+	if len(in) == 0 {
+		return "{}", nil
+	}
+
+	normalised, err := normaliseFields(in)
+	if err != nil {
+		return "", err
+	}
+	redacted := RedactFields(normalised)
 	if redacted == nil {
 		return "{}", nil
 	}
@@ -259,6 +281,20 @@ func EncodeFields(in map[string]any) (string, error) {
 		return "", fmt.Errorf("encode event fields: %w", err)
 	}
 	return string(b), nil
+}
+
+// normaliseFields round-trips fields through JSON so that every value is a
+// plain map, slice or scalar before redaction inspects it.
+func normaliseFields(in map[string]any) (map[string]any, error) {
+	encoded, err := json.Marshal(in)
+	if err != nil {
+		return nil, fmt.Errorf("encode event fields: %w", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(encoded, &out); err != nil {
+		return nil, fmt.Errorf("normalise event fields: %w", err)
+	}
+	return out, nil
 }
 
 // DecodeFields deserialises stored event fields.

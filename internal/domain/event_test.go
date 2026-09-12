@@ -2,6 +2,7 @@ package domain_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -113,4 +114,80 @@ func TestEventValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The short "pat" token must match only as a whole word: substring matching
+// would destroy ordinary field names in append-only history.
+func TestSensitiveTokenMatchingIsWordBounded(t *testing.T) {
+	mustSurvive := []string{
+		"root_path", "path", "patch", "compat", "pattern", "dispatch",
+		"patches", "compatibility", "workspace_path", "filePath", "PATH",
+	}
+	for _, key := range mustSurvive {
+		out := domain.RedactFields(map[string]any{key: "keep-me"})
+		if out[key] != "keep-me" {
+			t.Fatalf("ordinary field %q was destroyed", key)
+		}
+	}
+
+	mustRedact := []string{
+		"pat", "github_pat", "githubPat", "GITHUB_PAT", "pat.value",
+		"gh-pat", "pats", "token", "github_token", "authToken",
+		"password", "api_key", "ssh_key", "authorization", "session_cookie",
+	}
+	for _, key := range mustRedact {
+		out := domain.RedactFields(map[string]any{key: "fake-not-a-real-secret"})
+		if out[key] != domain.Redacted {
+			t.Fatalf("sensitive field %q survived as %v", key, out[key])
+		}
+	}
+}
+
+// Redaction must not recurse without bound, and must not be bypassable by a
+// value shape the type switch does not name.
+func TestEncodeFieldsHandlesHostileShapes(t *testing.T) {
+	t.Run("cycle is a clean error", func(t *testing.T) {
+		cyclic := map[string]any{}
+		cyclic["self"] = cyclic
+		if _, err := domain.EncodeFields(cyclic); err == nil {
+			t.Fatal("a cyclic structure was encoded")
+		}
+	})
+
+	t.Run("struct json tag is redacted", func(t *testing.T) {
+		type creds struct {
+			Token string `json:"github_token"`
+			Lane  string `json:"lane"`
+		}
+		encoded, err := domain.EncodeFields(map[string]any{
+			"a": creds{Token: "fake-not-a-real-token", Lane: "operator"},
+			"b": []creds{{Token: "fake-not-a-real-token"}},
+			"c": map[string]creds{"inner": {Token: "fake-not-a-real-token"}},
+			"d": &creds{Token: "fake-not-a-real-token"},
+		})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		if strings.Contains(encoded, "fake-not-a-real-token") {
+			t.Fatalf("a credential survived encoding: %s", encoded)
+		}
+		if !strings.Contains(encoded, `"lane":"operator"`) {
+			t.Fatalf("non-sensitive struct field was lost: %s", encoded)
+		}
+	})
+
+	t.Run("deep nesting is bounded", func(t *testing.T) {
+		// Deeper than the redaction depth limit.
+		deep := map[string]any{"leaf": "value"}
+		for range 200 {
+			deep = map[string]any{"next": deep}
+		}
+		out, err := domain.EncodeFields(deep)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		if out == "" {
+			t.Fatal("deeply nested fields produced no output")
+		}
+	})
 }

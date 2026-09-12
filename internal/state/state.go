@@ -168,6 +168,34 @@ func (s PublishStatus) Validate() error {
 	return nil
 }
 
+// CanTransitionTo reports whether moving a publication from s to next is a
+// permitted transition.
+//
+// A publication never returns to PENDING, and a REJECTED or OBSERVED outcome
+// is final. UNKNOWN is the one state that may still be resolved, because it
+// means "the outcome could not be determined yet" rather than a decided
+// outcome — but it is never itself treated as success.
+func (s PublishStatus) CanTransitionTo(next PublishStatus) bool {
+	if s == next {
+		return true
+	}
+	switch s {
+	case PublishPending:
+		// PENDING -> OBSERVED is permitted: if the publisher crashed after
+		// the remote mutation landed but before recording APPLIED, later
+		// reconciliation legitimately observes the effect directly.
+		return next == PublishApplied || next == PublishObserved ||
+			next == PublishRejected || next == PublishUnknown
+	case PublishApplied:
+		return next == PublishObserved || next == PublishUnknown
+	case PublishUnknown:
+		return next == PublishApplied || next == PublishObserved || next == PublishRejected
+	default:
+		// OBSERVED and REJECTED are terminal.
+		return false
+	}
+}
+
 // Validate reports whether the Intent is in its bounded set.
 func (i Intent) Validate() error {
 	if _, ok := intents[i]; !ok {

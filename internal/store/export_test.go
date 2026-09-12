@@ -29,3 +29,11 @@ func (t *Tx) QueryIntForTest(ctx context.Context, query string, args ...any) (in
 	err := t.tx.QueryRowContext(ctx, query, args...).Scan(&out)
 	return out, err
 }
+
+// RecycleConnectionsForTest forces the pool to discard its pooled connection,
+// so a test can check that a replacement connection still carries the
+// per-connection pragmas the DSN asked for.
+func (db *DB) RecycleConnectionsForTest() {
+	db.sql.SetMaxIdleConns(0)
+	db.sql.SetMaxIdleConns(1)
+}
