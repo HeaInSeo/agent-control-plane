@@ -43,6 +43,27 @@ const (
 	humanCommit = domain.CommitSHA("f00dcafe60de1f3c4a2a3f6d19d7919ca52a7c89")
 )
 
+// reviewEvidenceMatching builds valid READ_ONLY_REVIEW evidence: bound to the
+// fixed reviewed commit, carrying the artifact digest, and referencing no
+// publication (CC7).
+func reviewEvidenceMatching(id domain.AttemptIdentity, reviewed domain.CommitSHA) domain.EvidenceObservation {
+	return domain.EvidenceObservation{
+		EvidenceID:          ids.NewEvidenceID(),
+		TaskID:              id.TaskID,
+		AttemptID:           id.AttemptID,
+		SchedulerEpoch:      id.SchedulerEpoch,
+		FenceEpoch:          id.FenceEpoch,
+		RepositorySubjectID: id.RepositorySubjectID,
+		WorkspaceID:         id.WorkspaceID,
+		PublishedSHA:        reviewed,
+		ObservedSHA:         reviewed,
+		ReviewedSHA:         reviewed,
+		ArtifactDigest:      digestOf("review-artifact"),
+		ObservedAt:          now,
+		EvidenceKind:        domain.EvidenceReadOnlyReview,
+	}
+}
+
 func TestEvidenceAttributionRequiresEveryIdentityField(t *testing.T) {
 	id := attemptIdentity()
 	if err := evidenceMatching(id, ourCommit, ourCommit).CheckAttribution(id); err != nil {
@@ -133,18 +154,19 @@ func TestCompletionDerivation(t *testing.T) {
 
 	t.Run("review evidence cannot complete modifying work", func(t *testing.T) {
 		in := good
-		in.Evidence.EvidenceKind = domain.EvidenceReadOnlyReview
+		in.Evidence = reviewEvidenceMatching(id, ourCommit)
 		if _, err := domain.DeriveTaskCompletion(in); !errors.Is(err, domain.ErrEvidenceInsufficient) {
 			t.Fatalf("want ErrEvidenceInsufficient, got %v", err)
 		}
 	})
 
 	t.Run("read-only work completes on a fixed reviewed commit", func(t *testing.T) {
-		in := good
-		in.Intent = state.IntentReadOnly
-		in.Evidence.EvidenceKind = domain.EvidenceReadOnlyReview
-		in.Evidence.PublishAttemptID = nil
-		in.PublishStatus = state.PublishUnknown
+		in := domain.CompletionInput{
+			Attempt:       id,
+			Evidence:      reviewEvidenceMatching(id, ourCommit),
+			PublishStatus: state.PublishUnknown,
+			Intent:        state.IntentReadOnly,
+		}
 		derived, err := domain.DeriveTaskCompletion(in)
 		if err != nil {
 			t.Fatalf("read-only completion refused: %v", err)
@@ -183,4 +205,126 @@ func TestTaskCompletedIsOnlyReachableThroughEvidence(t *testing.T) {
 	if err := state.WorkerAttemptStatus("COMPLETED").Validate(); !errors.Is(err, state.ErrInvalidState) {
 		t.Fatal("COMPLETED is a valid WorkerAttemptStatus; it must not be")
 	}
+}
+
+// --- BC1: READ_ONLY completion requires a review binding ------------------
+
+// Generic repository-effect evidence must not complete a read-only task, even
+// when its two SHAs agree. For review work nothing is published, so equal
+// published/observed SHAs are self-selected and establish nothing.
+func TestReadOnlyCompletionRejectsRepositoryEffectEvidence(t *testing.T) {
+	id := attemptIdentity()
+
+	for _, kind := range []domain.EvidenceKind{domain.EvidenceBranchHead, domain.EvidencePullRequestHead} {
+		t.Run(string(kind), func(t *testing.T) {
+			ev := evidenceMatching(id, ourCommit, ourCommit)
+			ev.EvidenceKind = kind
+			ev.PublishAttemptID = nil
+
+			// The observation itself is well formed.
+			if err := ev.Validate(); err != nil {
+				t.Fatalf("repository-effect evidence should still be valid: %v", err)
+			}
+			// It satisfies the exact-effect rule.
+			if err := ev.SatisfiesExactEffect(); err != nil {
+				t.Fatalf("equal SHAs should satisfy the exact-effect rule: %v", err)
+			}
+			// And it must still not complete a read-only task.
+			if _, err := domain.DeriveTaskCompletion(domain.CompletionInput{
+				Attempt:       id,
+				Evidence:      ev,
+				PublishStatus: state.PublishUnknown,
+				Intent:        state.IntentReadOnly,
+			}); !errors.Is(err, domain.ErrEvidenceInsufficient) {
+				t.Fatalf("want ErrEvidenceInsufficient, got %v", err)
+			}
+		})
+	}
+
+	// A publication binding does not rescue it either.
+	t.Run("with a publication binding", func(t *testing.T) {
+		ev := evidenceMatching(id, ourCommit, ourCommit)
+		if _, err := domain.DeriveTaskCompletion(domain.CompletionInput{
+			Attempt:       id,
+			Evidence:      ev,
+			PublishStatus: state.PublishObserved,
+			Intent:        state.IntentReadOnly,
+		}); !errors.Is(err, domain.ErrEvidenceInsufficient) {
+			t.Fatalf("want ErrEvidenceInsufficient, got %v", err)
+		}
+	})
+}
+
+func TestReadOnlyReviewEvidenceRequiresItsFullBinding(t *testing.T) {
+	id := attemptIdentity()
+
+	if err := reviewEvidenceMatching(id, ourCommit).Validate(); err != nil {
+		t.Fatalf("valid review evidence rejected: %v", err)
+	}
+
+	cases := map[string]func(*domain.EvidenceObservation){
+		"no reviewed sha": func(e *domain.EvidenceObservation) {
+			e.ReviewedSHA = ""
+		},
+		"no artifact digest": func(e *domain.EvidenceObservation) {
+			e.ArtifactDigest = ""
+		},
+		"abbreviated reviewed sha": func(e *domain.EvidenceObservation) {
+			e.ReviewedSHA = "829777a"
+		},
+		"branch name as reviewed sha": func(e *domain.EvidenceObservation) {
+			e.ReviewedSHA = "main"
+		},
+		"short artifact digest": func(e *domain.EvidenceObservation) {
+			e.ArtifactDigest = "abc"
+		},
+		"reviewed sha drifted from observed": func(e *domain.EvidenceObservation) {
+			e.ObservedSHA = humanCommit
+		},
+		"reviewed sha drifted from published": func(e *domain.EvidenceObservation) {
+			e.PublishedSHA = humanCommit
+		},
+		"review borrowing a publication": func(e *domain.EvidenceObservation) {
+			pub := ids.NewPublishAttemptID()
+			e.PublishAttemptID = &pub
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			ev := reviewEvidenceMatching(id, ourCommit)
+			mutate(&ev)
+			if err := ev.Validate(); !errors.Is(err, domain.ErrEvidenceInvalid) {
+				t.Fatalf("want ErrEvidenceInvalid, got %v", err)
+			}
+			if _, err := domain.DeriveTaskCompletion(domain.CompletionInput{
+				Attempt:       id,
+				Evidence:      ev,
+				PublishStatus: state.PublishUnknown,
+				Intent:        state.IntentReadOnly,
+			}); err == nil {
+				t.Fatal("an incompletely bound review completed a read-only task")
+			}
+		})
+	}
+}
+
+// Repository-effect evidence must not carry a review binding, so the two
+// kinds of evidence cannot be blurred together from the other direction.
+func TestRepositoryEffectEvidenceRejectsReviewBinding(t *testing.T) {
+	id := attemptIdentity()
+
+	t.Run("carrying a reviewed sha", func(t *testing.T) {
+		ev := evidenceMatching(id, ourCommit, ourCommit)
+		ev.ReviewedSHA = ourCommit
+		if err := ev.Validate(); !errors.Is(err, domain.ErrEvidenceInvalid) {
+			t.Fatalf("want ErrEvidenceInvalid, got %v", err)
+		}
+	})
+	t.Run("carrying an artifact digest", func(t *testing.T) {
+		ev := evidenceMatching(id, ourCommit, ourCommit)
+		ev.ArtifactDigest = digestOf("artifact")
+		if err := ev.Validate(); !errors.Is(err, domain.ErrEvidenceInvalid) {
+			t.Fatalf("want ErrEvidenceInvalid, got %v", err)
+		}
+	})
 }

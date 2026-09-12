@@ -122,7 +122,7 @@ func (db *DB) Migrate(ctx context.Context, set []Migration) error {
 		return fmt.Errorf("%w: empty migration set", ErrMigrationsMalformed)
 	}
 
-	if err := db.ensureMigrationTable(ctx); err != nil {
+	if err := db.bootstrap(ctx); err != nil {
 		return err
 	}
 	applied, err := db.AppliedMigrations(ctx)
@@ -150,25 +150,96 @@ func (db *DB) MigrateEmbedded(ctx context.Context) error {
 	return db.Migrate(ctx, set)
 }
 
-func (db *DB) ensureMigrationTable(ctx context.Context) error {
-	const ddl = `
+// dbKind is the value stored under the `db_kind` marker key. Open refuses a
+// non-empty database that does not carry it.
+const dbKind = "agent-control-plane"
+
+// dbContract is the contract version of the durable layout.
+const dbContract = "v0.1"
+
+// bootstrap creates the database identity marker and the migration ledger in a
+// single transaction, before any migration runs.
+//
+// The two must be created together. If `schema_migration` could exist without
+// the `db_kind` marker — as it could when the ledger was created on its own
+// and the marker was created by the first migration — then a crash in between
+// would leave a database with tables but no marker, which the next Open would
+// refuse as foreign. That state is unrecoverable without deleting the file,
+// which for a scheduler database means deleting the execution history.
+//
+// Creating both atomically means the only reachable states are:
+//
+//	no tables at all              -> fresh, bootstrap it
+//	marker + ledger, 0 applied    -> ours, mid-bootstrap, retry the migrations
+//	marker + ledger, N applied    -> ours, migrate forward from N
+//
+// bootstrap is idempotent, so a retry after any crash is safe.
+func (db *DB) bootstrap(ctx context.Context) error {
+	if db.mode == ModeReadOnly {
+		return fmt.Errorf("%w: cannot bootstrap", ErrReadOnly)
+	}
+
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin bootstrap: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS control_plane_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) WITHOUT ROWID;`); err != nil {
+		return fmt.Errorf("store: create control_plane_meta: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO control_plane_meta (key, value) VALUES (?, ?), (?, ?)
+		 ON CONFLICT (key) DO NOTHING`,
+		"db_kind", dbKind, "db_contract", dbContract,
+	); err != nil {
+		return fmt.Errorf("store: write database identity marker: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS schema_migration (
     version    INTEGER PRIMARY KEY CHECK (version >= 1),
     name       TEXT NOT NULL,
     checksum   TEXT NOT NULL,
     applied_at TEXT NOT NULL
-) WITHOUT ROWID;`
-	if _, err := db.sql.ExecContext(ctx, ddl); err != nil {
+) WITHOUT ROWID;`); err != nil {
 		return fmt.Errorf("store: create schema_migration: %w", err)
+	}
+
+	// A pre-existing marker must still say this database is ours. Bootstrap is
+	// never a way to take over a file Open would have refused.
+	var kind string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT value FROM control_plane_meta WHERE key = 'db_kind'`).Scan(&kind); err != nil {
+		return fmt.Errorf("store: read database identity marker: %w", err)
+	}
+	if kind != dbKind {
+		return fmt.Errorf("%w: %s declares db_kind %q", ErrForeignDatabase, db.path, kind)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit bootstrap: %w", err)
 	}
 	return nil
 }
 
 // AppliedMigrations returns the recorded migration history, ordered by version.
+//
+// A database that has never been bootstrapped has no ledger and therefore no
+// history; that is reported as an empty history rather than an error, so an
+// inspector can look at a fresh or half-bootstrapped file without failing.
 func (db *DB) AppliedMigrations(ctx context.Context) ([]AppliedMigration, error) {
-	if err := db.ensureMigrationTableIfWritable(ctx); err != nil {
+	hasLedger, err := db.tableExists(ctx, "schema_migration")
+	if err != nil {
 		return nil, err
 	}
+	if !hasLedger {
+		return nil, nil
+	}
+
 	rows, err := db.sql.QueryContext(ctx,
 		`SELECT version, name, checksum, applied_at FROM schema_migration ORDER BY version`)
 	if err != nil {
@@ -198,13 +269,15 @@ func (db *DB) AppliedMigrations(ctx context.Context) ([]AppliedMigration, error)
 	return out, nil
 }
 
-// ensureMigrationTableIfWritable lets a read-only handle inspect the history of
-// a migrated database without trying to create anything.
-func (db *DB) ensureMigrationTableIfWritable(ctx context.Context) error {
-	if db.mode == ModeReadOnly {
-		return nil
+// tableExists reports whether a non-internal table is present.
+func (db *DB) tableExists(ctx context.Context, name string) (bool, error) {
+	var n int
+	if err := db.sql.QueryRowContext(ctx,
+		`SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = ?`, name,
+	).Scan(&n); err != nil {
+		return false, fmt.Errorf("store: look up table %q: %w", name, err)
 	}
-	return db.ensureMigrationTable(ctx)
+	return n > 0, nil
 }
 
 // SchemaVersion reports the highest applied migration version, or 0 for a

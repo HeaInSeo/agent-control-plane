@@ -101,7 +101,15 @@ Defences in M0:
 - The default effect rule is exact SHA equality, not ancestor-or-equal.
 - For modifying work, completion additionally requires a publication binding
   whose status is `APPLIED` or `OBSERVED`.
-- Evidence rows are immutable once written.
+- For read-only work, completion requires `READ_ONLY_REVIEW` evidence bound to
+  a fixed `reviewed_sha` and an `artifact_digest`, with no publication
+  reference. Generic `BRANCH_HEAD` or `PULL_REQUEST_HEAD` evidence cannot
+  complete a read-only task: review work publishes nothing, so equal
+  published/observed SHAs are self-selected and establish nothing. The two
+  kinds of evidence cannot carry each other's binding, in either direction,
+  even partially.
+- Evidence rows are immutable once written, which is what makes the artifact
+  digest a binding rather than a note.
 
 ## Stale scheduler acting as the owner
 
@@ -154,7 +162,13 @@ Defences in M0:
 - An empty `AllowedScope` authorises nothing and fails validation.
 - `Authorize` requires the observed `source_revision` and `source_digest` to
   match what was approved. A mismatch is `ErrPacketStale`, a stop condition.
-- A stored packet's binding and scope are immutable; only its status moves.
+- Every authority-bearing column of a stored packet is immutable after
+  approval — not only the source binding and scope, but also lane, intent,
+  repository subject, approval and expiry times, stop conditions and the
+  acceptance contract. Only `status` moves.
+- `status` moves only along `APPROVED -> STALE`, `APPROVED -> SUPERSEDED` or
+  `STALE -> SUPERSEDED`. A packet that lost authority never regains it, so a
+  stopped execution cannot be re-authorised by a status write.
 
 An immutable source snapshot may later be given to a worker as explanatory
 context. It must not become a second runtime authority.
@@ -174,19 +188,38 @@ Defences in M0:
 - A schema newer than the running build fails closed.
 - A tampered migration checksum, or a recorded migration this build does not
   know, fails closed.
+- Bootstrap writes the identity marker and the migration ledger in one
+  transaction before any migration, so a crash mid-bootstrap leaves a database
+  that is recognisably ours and safely retryable instead of one that fails as
+  foreign and can only be recovered by deleting the history. Bootstrap is
+  idempotent and never adopts a file whose marker names another owner.
+- Each migration and its ledger entry share one transaction, so a failed step
+  leaves neither its schema changes nor a record claiming it succeeded.
 - Event history rejects `UPDATE` and `DELETE`.
 
 ## Secrets in history
 
 Event fields are redacted on append by key-name matching over token, secret,
 password, credential, authorization, bearer, cookie, private key, API key,
-access key, session key, SSH key, signature and PAT fragments, recursing into
-nested maps. Redaction happens inside the store, so a caller that passes a
+access key, session key, SSH key, signature and PAT fragments.
+
+Redaction descends through every container, not only maps: a sensitive key
+nested inside a list, inside a list of lists, or inside a typed Go slice of
+maps is redacted too, so a shape like
+
+```json
+{"items": [{"authorization": "..."}]}
+```
+
+cannot reach durable history with its credential intact. A sensitive key whose
+value is itself a container has the whole value replaced rather than being
+descended into. Redaction happens inside the store, so a caller that passes a
 credential cannot get it into durable history.
 
 This is defence in depth, not a licence to pass secrets: key-name matching
-cannot catch a credential stored under an innocuous name, or one embedded in a
-free-text message.
+cannot catch a credential stored under an innocuous name, one embedded in a
+free-text message, or one sitting as a bare element of a list where there is
+no key to match on.
 
 ## Known gaps at M0
 

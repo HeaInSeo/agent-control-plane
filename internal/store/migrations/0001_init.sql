@@ -5,21 +5,12 @@
 -- a partial unique index is enough, no trigger is used; triggers cover
 -- cross-row identity coherence, which constraints cannot express.
 
--- ---------------------------------------------------------------------------
--- Database identity marker.
---
--- Open() refuses a non-empty database that does not carry this marker, so the
--- control plane can never quietly adopt, migrate or overwrite somebody else's
--- SQLite file.
--- ---------------------------------------------------------------------------
-CREATE TABLE control_plane_meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-) WITHOUT ROWID;
-
-INSERT INTO control_plane_meta (key, value) VALUES
-    ('db_kind', 'agent-control-plane'),
-    ('db_contract', 'v0.1');
+-- Note: `control_plane_meta` (the database identity marker) and
+-- `schema_migration` (the migration ledger) are NOT created here. They are
+-- created together in one bootstrap transaction before any migration runs, so
+-- that a crash between bootstrap and the first migration leaves a database
+-- that is recognisably ours and safely retryable rather than one that later
+-- fails as foreign. See store.bootstrap.
 
 -- ---------------------------------------------------------------------------
 -- SchedulerEpoch (CC4): scheduler ownership generation.
@@ -118,20 +109,54 @@ CREATE TABLE execution_packet (
 
 CREATE INDEX ix_execution_packet_task ON execution_packet (task_id);
 
--- Source binding is what makes the packet a snapshot. Rebinding an approved
--- packet to a different design revision would silently re-authorise it.
-CREATE TRIGGER trg_execution_packet_binding_immutable
+-- An approved ExecutionPacket is an immutable execution contract. Every
+-- authority-bearing field is frozen at approval; only `status` may move, and
+-- only along a permitted transition (see the trigger below).
+--
+-- This covers every column of the table except `status`. Rebinding any of
+-- them after approval would silently re-authorise the packet: a widened
+-- scope, a later expiry, a different lane or intent, a relaxed acceptance
+-- contract or a removed stop condition are all changes of authority, not
+-- bookkeeping.
+CREATE TRIGGER trg_execution_packet_content_immutable
 BEFORE UPDATE ON execution_packet
 FOR EACH ROW
-WHEN NEW.source_revision <> OLD.source_revision
-  OR NEW.source_digest   <> OLD.source_digest
-  OR NEW.packet_digest   <> OLD.packet_digest
-  OR NEW.allowed_scope   <> OLD.allowed_scope
-  OR NEW.forbidden_scope <> OLD.forbidden_scope
-  OR NEW.task_id         <> OLD.task_id
-  OR NEW.repository_subject_id <> OLD.repository_subject_id
+WHEN NEW.packet_id            IS NOT OLD.packet_id
+  OR NEW.task_id              IS NOT OLD.task_id
+  OR NEW.lane                 IS NOT OLD.lane
+  OR NEW.intent               IS NOT OLD.intent
+  OR NEW.repository_subject_id IS NOT OLD.repository_subject_id
+  OR NEW.source_revision      IS NOT OLD.source_revision
+  OR NEW.source_digest        IS NOT OLD.source_digest
+  OR NEW.packet_digest        IS NOT OLD.packet_digest
+  OR NEW.approved_at          IS NOT OLD.approved_at
+  OR NEW.expires_at           IS NOT OLD.expires_at
+  OR NEW.allowed_scope        IS NOT OLD.allowed_scope
+  OR NEW.forbidden_scope      IS NOT OLD.forbidden_scope
+  OR NEW.stop_conditions      IS NOT OLD.stop_conditions
+  OR NEW.acceptance_contract  IS NOT OLD.acceptance_contract
 BEGIN
-    SELECT RAISE(ABORT, 'approved packet binding and scope are immutable');
+    SELECT RAISE(ABORT, 'approved packet content is immutable; only status may change');
+END;
+
+-- Permitted status transitions only. Authority is never regained: a packet
+-- that went STALE or SUPERSEDED cannot become APPROVED again, because that
+-- would revive an execution authority whose binding was already found not to
+-- hold.
+--
+--   APPROVED -> STALE
+--   APPROVED -> SUPERSEDED
+--   STALE    -> SUPERSEDED
+CREATE TRIGGER trg_execution_packet_status_transition
+BEFORE UPDATE OF status ON execution_packet
+FOR EACH ROW
+WHEN NEW.status IS NOT OLD.status
+ AND NOT (
+        (OLD.status = 'APPROVED' AND NEW.status IN ('STALE', 'SUPERSEDED'))
+     OR (OLD.status = 'STALE'    AND NEW.status = 'SUPERSEDED')
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'forbidden packet status transition');
 END;
 
 -- ---------------------------------------------------------------------------
@@ -412,8 +437,34 @@ CREATE TABLE evidence_observation (
     published_sha         TEXT NOT NULL CHECK (length(published_sha) = 40 AND NOT published_sha GLOB '*[^0-9a-f]*'),
     observed_sha          TEXT NOT NULL CHECK (length(observed_sha) = 40 AND NOT observed_sha GLOB '*[^0-9a-f]*'),
 
+    -- Read-only review binding (CC7). NULL for repository-effect evidence.
+    reviewed_sha          TEXT CHECK (reviewed_sha IS NULL OR (length(reviewed_sha) = 40 AND NOT reviewed_sha GLOB '*[^0-9a-f]*')),
+    artifact_digest       TEXT CHECK (artifact_digest IS NULL OR (length(artifact_digest) = 64 AND NOT artifact_digest GLOB '*[^0-9a-f]*')),
+
     observed_at           TEXT NOT NULL,
-    evidence_kind         TEXT NOT NULL CHECK (evidence_kind IN ('BRANCH_HEAD', 'PULL_REQUEST_HEAD', 'READ_ONLY_REVIEW'))
+    evidence_kind         TEXT NOT NULL CHECK (evidence_kind IN ('BRANCH_HEAD', 'PULL_REQUEST_HEAD', 'READ_ONLY_REVIEW')),
+
+    -- CC7: read-only review evidence must bind the fixed reviewed SHA and the
+    -- immutable review artifact digest, and repository-effect evidence must
+    -- not carry either of them.
+    --
+    -- One biconditional per column, deliberately. A single combined
+    -- `(kind = 'READ_ONLY_REVIEW') = (reviewed_sha IS NOT NULL AND
+    -- artifact_digest IS NOT NULL)` is satisfied by a BRANCH_HEAD row that
+    -- carries exactly one of the two, because the conjunction is then false
+    -- on both sides. Per-column keeps the two kinds of evidence from blurring
+    -- into each other in either direction.
+    CHECK ((evidence_kind = 'READ_ONLY_REVIEW') = (reviewed_sha IS NOT NULL)),
+    CHECK ((evidence_kind = 'READ_ONLY_REVIEW') = (artifact_digest IS NOT NULL)),
+
+    -- The review is bound to the exact commit it reviewed. Without this a
+    -- review could name one commit and be observed against another.
+    CHECK (evidence_kind <> 'READ_ONLY_REVIEW'
+           OR (reviewed_sha = observed_sha AND reviewed_sha = published_sha)),
+
+    -- A read-only review publishes nothing, so it can never borrow a
+    -- publication to look like a repository effect.
+    CHECK (evidence_kind <> 'READ_ONLY_REVIEW' OR publish_attempt_id IS NULL)
 ) WITHOUT ROWID;
 
 CREATE INDEX ix_evidence_attempt ON evidence_observation (attempt_id);

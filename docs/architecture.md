@@ -148,14 +148,51 @@ it while the approved effect is no longer the state of the ref. A future effect
 that legitimately transforms commits — a merge-generated commit, say — needs
 its own explicit evidence contract with provenance, not a loosened default.
 
+Read-only work has its own evidence contract, because it publishes nothing.
+A `READ_ONLY_REVIEW` observation must bind `reviewed_sha` — the fixed commit
+the review was performed against — and `artifact_digest`, the digest of the
+immutable artifact the review produced. `reviewed_sha` must equal both the
+observed and the published SHA, and the observation must reference no
+publication.
+
+Generic repository-effect evidence cannot complete a read-only task at all.
+For review work nothing is published, so a `BRANCH_HEAD` observation whose two
+SHAs agree is self-selected and establishes nothing; `DeriveTaskCompletion`
+requires `READ_ONLY_REVIEW` evidence for `READ_ONLY` intent, and rejects
+`READ_ONLY_REVIEW` evidence for `MODIFYING` intent. The schema holds the same
+contract: one biconditional per review column against the evidence kind, so
+neither kind of evidence can carry the other's binding — not even partially.
+
 ### CC8 — closed-world ExecutionPacket
 
 `ExecutionPacket.DecideScope` returns allow only for an explicitly allowed
 action. Forbidden wins over allowed; unspecified is denied; an empty
 `AllowedScope` is a validation error rather than an unbounded world.
 `Authorize` re-checks status, expiry and source binding (`source_revision` and
-`source_digest`) before launch and before resume, and a stored packet's binding
-and scope are immutable — only its status may move.
+`source_digest`) before launch and before resume.
+
+An approved packet is an immutable execution contract. Every column of
+`execution_packet` except `status` is frozen at approval — `task_id`, `lane`,
+`intent`, `repository_subject_id`, `source_revision`, `source_digest`,
+`packet_digest`, `approved_at`, `expires_at`, `allowed_scope`,
+`forbidden_scope`, `stop_conditions` and `acceptance_contract`. A widened
+scope, a later expiry, a changed lane or intent, a relaxed acceptance contract
+or a removed stop condition are all changes of authority, so none of them is
+reachable after approval.
+
+`status` moves only along a permitted transition:
+
+```text
+APPROVED -> STALE
+APPROVED -> SUPERSEDED
+STALE    -> SUPERSEDED
+```
+
+Nothing returns to `APPROVED`. Reviving a packet whose binding was already
+found not to hold would re-authorise an execution that was stopped for cause;
+a new approval is a new packet. Both the Go guard
+(`state.PacketStatus.CanTransitionTo`, checked in `SetPacketStatus`) and a
+schema trigger enforce this.
 
 ### CC9 — lane-agnostic modifying admission
 
@@ -192,7 +229,26 @@ Migrations are embedded, forward-only and contiguous from version 1, each
 recorded with a SHA-256 checksum. Replay is idempotent and doubles as a
 consistency check. A database migrated beyond what the running build knows
 fails with `ErrSchemaVersionUnsupported` rather than being treated as close
-enough.
+enough. Each migration runs inside one transaction together with its own
+ledger entry, so a step can never be recorded as applied when it was not.
+
+Bootstrap — the database identity marker plus the migration ledger — is a
+single transaction that runs before any migration. The two must be created
+together: a ledger without the marker would be a database with tables and no
+marker, which the next open would refuse as foreign, and for a scheduler
+database that is unrecoverable without deleting the execution history. With
+bootstrap atomic, the only reachable states are
+
+```text
+no tables at all            -> fresh, bootstrap it
+marker + ledger, 0 applied  -> ours, mid-bootstrap, retry the migrations
+marker + ledger, N applied  -> ours, migrate forward from N
+```
+
+and bootstrap is idempotent, so a retry after a crash at any point is safe.
+Bootstrap never adopts a file: a pre-existing marker declaring another owner
+is rejected inside the bootstrap transaction, so foreign-database rejection is
+not weakened by the recovery path.
 
 ## Not in M0
 

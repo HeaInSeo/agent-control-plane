@@ -52,7 +52,10 @@ The four that shape everything else:
 module that maps a process exit code, or a worker's self-report, onto a task
 status. `state.TaskCompleted` is reachable only through
 `domain.DeriveTaskCompletion`, which requires an externally observed effect
-bound to the right attempt, epoch, repository and workspace.
+bound to the right attempt, epoch, repository and workspace. Modifying work
+needs an applied or observed publication; read-only work needs review evidence
+bound to a fixed reviewed commit and an artifact digest, never a generic
+branch-head observation.
 
 **A worker has no remote mutation authority.** Workers edit, build, test and
 commit locally inside their own workspace. Remote mutation is scheduler-owned
@@ -61,7 +64,9 @@ branch head" is forbidden by construction.
 
 **An approved packet is a closed world.** Explicitly allowed is allowed;
 everything else, including anything merely absent from `forbidden_scope`, is
-denied. A source-binding mismatch is a stop, not a warning.
+denied. A source-binding mismatch is a stop, not a warning. An approved packet
+is also immutable: every authority-bearing field is frozen at approval, and its
+status only ever moves away from authority, never back towards it.
 
 **Unknown state fails closed.** A missing, foreign, corrupt or
 newer-than-supported database is an error. The control plane never starts over

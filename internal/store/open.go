@@ -237,8 +237,15 @@ func (db *DB) IntegrityCheck(ctx context.Context) error {
 // verifyOwnMarker refuses a pre-existing database that is not ours.
 //
 // A database with no tables at all is accepted: that is a file this process is
-// about to migrate. A database with tables but without our marker is refused,
-// so the control plane cannot adopt or damage an unrelated SQLite file.
+// about to bootstrap. A database with tables but without our marker is
+// refused, so the control plane cannot adopt or damage an unrelated SQLite
+// file.
+//
+// The marker is written in the bootstrap transaction, together with the
+// migration ledger and before any migration runs, so a database of ours
+// always carries it from the first commit onwards. A half-bootstrapped
+// database is therefore recognised as ours and can be retried; there is no
+// intermediate state with tables but no marker to make an allowance for.
 func (db *DB) verifyOwnMarker(ctx context.Context) error {
 	var tables int
 	if err := db.sql.QueryRowContext(ctx,
@@ -258,7 +265,7 @@ func (db *DB) verifyOwnMarker(ctx context.Context) error {
 		return fmt.Errorf("%w: %s has %d tables but no db_kind marker", ErrForeignDatabase, db.path, tables)
 	case err != nil:
 		return fmt.Errorf("%w: %s: %w", ErrForeignDatabase, db.path, err)
-	case kind != "agent-control-plane":
+	case kind != dbKind:
 		return fmt.Errorf("%w: %s declares db_kind %q", ErrForeignDatabase, db.path, kind)
 	}
 	return nil

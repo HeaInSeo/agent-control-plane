@@ -11,6 +11,10 @@ import (
 	"github.com/HeaInSeo/agent-control-plane/internal/state"
 )
 
+// ErrForbiddenPacketTransition is returned when a packet status change is not
+// a permitted transition.
+var ErrForbiddenPacketTransition = errors.New("forbidden packet status transition")
+
 // ---------------------------------------------------------------------------
 // RepositorySubject (CC5)
 // ---------------------------------------------------------------------------
@@ -278,9 +282,22 @@ func (t *Tx) Packet(ctx context.Context, id ids.PacketID) (domain.ExecutionPacke
 // SetPacketStatus moves a packet within PacketStatus only. It cannot be passed
 // a value from another state domain: the parameter type makes that a compile
 // error rather than a runtime surprise.
+//
+// Only a permitted transition is accepted. The packet's content is immutable
+// after approval, and its status never moves back towards authority, so this
+// is the only mutation an approved packet ever accepts. The same rule is
+// enforced by a schema trigger.
 func (t *Tx) SetPacketStatus(ctx context.Context, id ids.PacketID, status state.PacketStatus) error {
 	if err := status.Validate(); err != nil {
 		return err
+	}
+	current, err := t.Packet(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !current.Status.CanTransitionTo(status) {
+		return fmt.Errorf("%w: packet %s cannot move from %q to %q",
+			ErrForbiddenPacketTransition, string(id), string(current.Status), string(status))
 	}
 	return t.exactlyOne(ctx, "execution packet", string(id),
 		`UPDATE execution_packet SET status = ? WHERE packet_id = ?`, string(status), string(id))

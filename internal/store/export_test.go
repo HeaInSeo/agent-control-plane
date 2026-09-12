@@ -2,6 +2,16 @@ package store
 
 import "context"
 
+// BootstrapForTest runs only the bootstrap step — the database identity
+// marker and the migration ledger — without applying any migration.
+//
+// It exists so tests can stop at the exact crash point between bootstrap and
+// the first migration and prove that the next open recovers. Production code
+// reaches bootstrap only through Migrate.
+func (db *DB) BootstrapForTest(ctx context.Context) error {
+	return db.bootstrap(ctx)
+}
+
 // ExecForTest runs a raw statement inside the transaction.
 //
 // It exists only for tests, and only in the test build: adversarial tests need

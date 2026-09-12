@@ -212,6 +212,27 @@ func evidenceFor(f fixture, published, observed domain.CommitSHA, pub *ids.Publi
 	}
 }
 
+// reviewEvidenceFor builds valid READ_ONLY_REVIEW evidence for a fixture:
+// bound to the fixed reviewed commit, carrying an artifact digest, and
+// referencing no publication (CC7).
+func reviewEvidenceFor(f fixture, reviewed domain.CommitSHA, artifact string) domain.EvidenceObservation {
+	return domain.EvidenceObservation{
+		EvidenceID:          ids.NewEvidenceID(),
+		TaskID:              f.Task.TaskID,
+		AttemptID:           f.Attempt.AttemptID,
+		SchedulerEpoch:      f.Attempt.SchedulerEpoch,
+		FenceEpoch:          f.Attempt.FenceEpoch,
+		RepositorySubjectID: f.Subject.RepositorySubjectID,
+		WorkspaceID:         f.Workspace.WorkspaceID,
+		PublishedSHA:        reviewed,
+		ObservedSHA:         reviewed,
+		ReviewedSHA:         reviewed,
+		ArtifactDigest:      digestOf(artifact),
+		ObservedAt:          fixedNow,
+		EvidenceKind:        domain.EvidenceReadOnlyReview,
+	}
+}
+
 func eventFor(epoch domain.Epoch, typ string) domain.Event {
 	return domain.Event{
 		SchedulerEpoch: epoch,

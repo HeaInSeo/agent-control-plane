@@ -150,16 +150,28 @@ func (t *Tx) RecordEvidence(ctx context.Context, e domain.EvidenceObservation) e
 		`INSERT INTO evidence_observation (evidence_id, task_id, attempt_id, scheduler_epoch,
 		                                   fence_epoch, repository_subject_id, workspace_id,
 		                                   publish_attempt_id, published_sha, observed_sha,
+		                                   reviewed_sha, artifact_digest,
 		                                   observed_at, evidence_kind)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		string(e.EvidenceID), string(e.TaskID), string(e.AttemptID), int64(e.SchedulerEpoch),
 		int64(e.FenceEpoch), string(e.RepositorySubjectID), string(e.WorkspaceID),
 		publishIDArg(e.PublishAttemptID), string(e.PublishedSHA), string(e.ObservedSHA),
+		nullIfEmpty(string(e.ReviewedSHA)), nullIfEmpty(string(e.ArtifactDigest)),
 		formatTime(e.ObservedAt), string(e.EvidenceKind),
 	); err != nil {
 		return fmt.Errorf("insert evidence observation: %w", err)
 	}
 	return nil
+}
+
+// nullIfEmpty stores an absent optional string as SQL NULL, so the schema's
+// biconditional CHECK on the review binding sees a real absence rather than
+// an empty string.
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 func publishIDArg(id *ids.PublishAttemptID) any {
@@ -179,15 +191,18 @@ func (t *Tx) Evidence(ctx context.Context, id ids.EvidenceID) (domain.EvidenceOb
 		evidenceKind                          string
 		schedEpoch, fenceEpoch                int64
 		publishID                             sql.NullString
+		reviewedSHA, artifactDigest           sql.NullString
 	)
 	err := t.tx.QueryRowContext(ctx,
 		`SELECT evidence_id, task_id, attempt_id, scheduler_epoch, fence_epoch,
 		        repository_subject_id, workspace_id, publish_attempt_id,
-		        published_sha, observed_sha, observed_at, evidence_kind
+		        published_sha, observed_sha, reviewed_sha, artifact_digest,
+		        observed_at, evidence_kind
 		   FROM evidence_observation WHERE evidence_id = ?`, string(id),
 	).Scan(&evID, &taskID, &attemptID, &schedEpoch, &fenceEpoch,
 		&repoSubject, &workspaceID, &publishID,
-		&publishedSHA, &observedSHA, &observedAt, &evidenceKind)
+		&publishedSHA, &observedSHA, &reviewedSHA, &artifactDigest,
+		&observedAt, &evidenceKind)
 	if errors.Is(err, sql.ErrNoRows) {
 		return out, fmt.Errorf("%w: evidence observation %s", ErrNotFound, string(id))
 	}
@@ -208,6 +223,8 @@ func (t *Tx) Evidence(ctx context.Context, id ids.EvidenceID) (domain.EvidenceOb
 		WorkspaceID:         ids.WorkspaceID(workspaceID),
 		PublishedSHA:        domain.CommitSHA(publishedSHA),
 		ObservedSHA:         domain.CommitSHA(observedSHA),
+		ReviewedSHA:         domain.CommitSHA(reviewedSHA.String),
+		ArtifactDigest:      domain.Digest(artifactDigest.String),
 		ObservedAt:          at,
 		EvidenceKind:        domain.EvidenceKind(evidenceKind),
 	}

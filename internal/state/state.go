@@ -208,3 +208,25 @@ func (s WorkerAttemptStatus) IsTerminal() bool {
 // GrantsExecutionAuthority reports whether a packet in this status may still
 // authorise execution. Anything other than APPROVED fails closed.
 func (s PacketStatus) GrantsExecutionAuthority() bool { return s == PacketApproved }
+
+// CanTransitionTo reports whether moving a packet from s to next is a
+// permitted transition.
+//
+// An approved packet is an immutable execution contract: its content never
+// changes, and its status moves only in the direction that removes authority.
+// Nothing returns to APPROVED — reviving a packet whose source binding was
+// already found not to hold would re-authorise an execution that was stopped
+// for cause. A new approval is a new packet.
+func (s PacketStatus) CanTransitionTo(next PacketStatus) bool {
+	if s == next {
+		return true
+	}
+	switch s {
+	case PacketApproved:
+		return next == PacketStale || next == PacketSuperseded
+	case PacketStale:
+		return next == PacketSuperseded
+	default:
+		return false
+	}
+}
