@@ -28,6 +28,9 @@ var ErrForbiddenTaskTransition = errors.New("forbidden task run status transitio
 
 // CreateTaskRun stores a new scheduling subject.
 func (t *Tx) CreateTaskRun(ctx context.Context, run domain.TaskRun) error {
+	if err := t.RequireOwnership(ctx); err != nil {
+		return err
+	}
 	if err := run.Validate(); err != nil {
 		return err
 	}
@@ -118,6 +121,9 @@ func (t *Tx) TaskRun(ctx context.Context, id ids.TaskID) (domain.TaskRun, error)
 // derived from evidence by CompleteTaskRunFromEvidence, so no caller — and in
 // particular no worker-exit handler — can write it directly (I1).
 func (t *Tx) SetTaskRunStatus(ctx context.Context, id ids.TaskID, status state.TaskRunStatus) error {
+	if err := t.RequireOwnership(ctx); err != nil {
+		return err
+	}
 	if err := status.Validate(); err != nil {
 		return err
 	}
@@ -145,6 +151,9 @@ func (t *Tx) SetTaskRunStatus(ctx context.Context, id ids.TaskID, status state.T
 // pointer that could be moved backwards onto a fenced-out attempt would
 // quietly undo that guarantee.
 func (t *Tx) SetTaskCurrentAttempt(ctx context.Context, id ids.TaskID, attempt ids.AttemptID) error {
+	if err := t.RequireOwnership(ctx); err != nil {
+		return err
+	}
 	if err := attempt.Validate(); err != nil {
 		return err
 	}
@@ -196,6 +205,9 @@ func (t *Tx) SetTaskCurrentAttempt(ctx context.Context, id ids.TaskID, attempt i
 // caller cannot supply a favourable-looking conclusion. Every failure leaves
 // the task where it was.
 func (t *Tx) CompleteTaskRunFromEvidence(ctx context.Context, taskID ids.TaskID, evidenceID ids.EvidenceID) error {
+	if err := t.RequireOwnership(ctx); err != nil {
+		return err
+	}
 	run, err := t.TaskRun(ctx, taskID)
 	if err != nil {
 		return err
@@ -264,6 +276,15 @@ func (t *Tx) CompleteTaskRunFromEvidence(ctx context.Context, taskID ids.TaskID,
 		publishStatus = pub.Status
 	}
 
+	// Refuse a task whose scheduling state cannot legally reach COMPLETED,
+	// with a typed error. Without this the schema trigger rejects the UPDATE
+	// and the caller sees a raw driver constraint failure for what is in fact
+	// a legitimate refusal.
+	if !run.Status.CanTransitionTo(state.TaskCompleted) {
+		return fmt.Errorf("%w: task %s is %s and cannot reach COMPLETED",
+			ErrForbiddenTaskTransition, string(taskID), string(run.Status))
+	}
+
 	derived, err := domain.DeriveTaskCompletion(domain.CompletionInput{
 		Attempt: domain.AttemptIdentity{
 			AttemptID:           attempt.AttemptID,
@@ -307,6 +328,9 @@ func (t *Tx) NextFenceEpoch(ctx context.Context, taskID ids.TaskID) (domain.Fenc
 // and again by a schema trigger, because this is the boundary where a stale
 // scheduler generation would otherwise acquire live ownership.
 func (t *Tx) CreateWorkerAttempt(ctx context.Context, a domain.WorkerAttempt) error {
+	if err := t.RequireOwnership(ctx); err != nil {
+		return err
+	}
 	if err := a.Validate(); err != nil {
 		return err
 	}
@@ -320,6 +344,21 @@ func (t *Tx) CreateWorkerAttempt(ctx context.Context, a domain.WorkerAttempt) er
 	if run.Status.IsTerminal() {
 		return fmt.Errorf("%w: task %s is %s and cannot admit a new attempt",
 			ErrInvalidTaskRun, string(a.TaskID), string(run.Status))
+	}
+	// Admission is the third place packet authority has to hold, alongside
+	// launch/resume and publication. A STALE or SUPERSEDED packet means
+	// execution must stop, so it must not be the basis for starting more.
+	packet, err := t.Packet(ctx, a.PacketID)
+	if err != nil {
+		return err
+	}
+	if !packet.Status.GrantsExecutionAuthority() {
+		return fmt.Errorf("%w: packet %s status is %q",
+			domain.ErrPacketNoAuthority, string(a.PacketID), string(packet.Status))
+	}
+	if !t.Now().Before(packet.ExpiresAt) {
+		return fmt.Errorf("%w: packet %s expired at %s",
+			domain.ErrPacketExpired, string(a.PacketID), packet.ExpiresAt.UTC())
 	}
 	now := t.Now()
 	if a.CreatedAt.IsZero() {
@@ -409,6 +448,9 @@ var ErrForbiddenAttemptTransition = errors.New("forbidden worker attempt status 
 // Only a permitted transition is accepted: live states move forward and a
 // terminal state is final. The same rule is enforced by a schema trigger.
 func (t *Tx) SetWorkerAttemptStatus(ctx context.Context, id ids.AttemptID, status state.WorkerAttemptStatus) error {
+	if err := t.RequireOwnership(ctx); err != nil {
+		return err
+	}
 	if err := status.Validate(); err != nil {
 		return err
 	}
@@ -431,6 +473,9 @@ func (t *Tx) SetWorkerAttemptStatus(ctx context.Context, id ids.AttemptID, statu
 
 // CreateWorkspace records the workspace owned by one attempt.
 func (t *Tx) CreateWorkspace(ctx context.Context, w domain.Workspace) error {
+	if err := t.RequireOwnership(ctx); err != nil {
+		return err
+	}
 	if w.CreatedAt.IsZero() {
 		w.CreatedAt = t.Now()
 	}
@@ -513,6 +558,9 @@ func (t *Tx) scanWorkspace(row *sql.Row, what string) (domain.Workspace, error) 
 // write: the first release is when the workspace stopped being usable, and
 // overwriting that timestamp would lose it.
 func (t *Tx) ReleaseWorkspace(ctx context.Context, id ids.WorkspaceID) error {
+	if err := t.RequireOwnership(ctx); err != nil {
+		return err
+	}
 	existing, err := t.Workspace(ctx, id)
 	if err != nil {
 		return err

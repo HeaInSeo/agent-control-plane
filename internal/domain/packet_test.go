@@ -257,3 +257,64 @@ func TestIdempotencyKeyDistinguishesIntents(t *testing.T) {
 		})
 	}
 }
+
+// Only a whole trailing HEAD component is symbolic. Rejecting any ref merely
+// containing the substring would make an ordinary branch permanently
+// unpublishable, since the schema mirrors these rules.
+func TestTargetRefHeadMatchingIsComponentWise(t *testing.T) {
+	for _, ok := range []string{
+		"refs/heads/fix-HEADER-parsing",
+		"refs/heads/HEADER",
+		"refs/heads/subject-HEAD-line",
+		"refs/heads/HEADless",
+	} {
+		if err := domain.ValidateTargetRef(ok); err != nil {
+			t.Fatalf("%q rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"HEAD", "refs/HEAD", "refs/heads/HEAD", "refs/remotes/origin/HEAD"} {
+		if err := domain.ValidateTargetRef(bad); !errors.Is(err, domain.ErrPublishTargetInvalid) {
+			t.Fatalf("%q accepted: %v", bad, err)
+		}
+	}
+}
+
+// The ref-name rules must match what Git itself accepts, per component.
+func TestTargetRefFollowsGitCheckRefFormat(t *testing.T) {
+	for _, bad := range []string{
+		"refs/heads/.hidden",     // component starting with a dot
+		"refs/heads/a.",          // component ending with a dot
+		"refs/heads//double",     // empty component
+		"refs/heads/@{upstream}", // @{ sequence
+		"refs/heads/a\x01b",      // control character
+		"refs/heads/a\x7fb",      // DEL
+		"refs/heads/x.lock/y",    // .lock on an inner component
+		"refs/heads/x.lock",      // .lock on the last component
+		"refs/heads/@",           // a component that is just @
+		"refs/heads/a:b",
+		"refs/heads/a?b",
+		"refs/heads/a[b",
+		"refs/heads/a\\b",
+		"refs/heads/a~b",
+		"refs/heads/a^b",
+		"refs/heads/a b",
+		"refs/heads/a..b",
+		"refs/heads/",
+	} {
+		if err := domain.ValidateTargetRef(bad); !errors.Is(err, domain.ErrPublishTargetInvalid) {
+			t.Fatalf("%q accepted by ValidateTargetRef", bad)
+		}
+	}
+	for _, ok := range []string{
+		"refs/heads/main",
+		"refs/heads/m0/bootstrap-contract",
+		"refs/heads/feature/a.b.c",
+		"refs/heads/user@example",
+		"refs/pull/12/head",
+		"refs/tags/v1.0.0",
+	} {
+		if err := domain.ValidateTargetRef(ok); err != nil {
+			t.Fatalf("%q rejected: %v", ok, err)
+		}
+	}
+}

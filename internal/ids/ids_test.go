@@ -98,3 +98,21 @@ func TestIdentifiersCarryTheirKindAsAPrefix(t *testing.T) {
 		}
 	}
 }
+
+// hex.DecodeString accepts either case, so validation has to pin it: an
+// identifier and its uppercase spelling would otherwise be two distinct
+// primary keys for one 128-bit value.
+func TestIdentifiersMustBeLowercaseHex(t *testing.T) {
+	id := ids.NewTaskID()
+	upper := ids.TaskID("task_" + strings.ToUpper(strings.TrimPrefix(string(id), "task_")))
+
+	if err := id.Validate(); err != nil {
+		t.Fatalf("a minted identifier was rejected: %v", err)
+	}
+	if err := upper.Validate(); !errors.Is(err, ids.ErrMalformedID) {
+		t.Fatalf("an uppercase identifier was accepted: %v", err)
+	}
+	if upper == id {
+		t.Fatal("test is vacuous: the identifier has no letters")
+	}
+}

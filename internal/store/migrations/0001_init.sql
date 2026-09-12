@@ -375,6 +375,19 @@ WHEN (SELECT repository_subject_id FROM task_run WHERE task_id = NEW.task_id) IS
 BEGIN
     SELECT RAISE(ABORT, 'worker_attempt identity must match its task_run');
 END;
+-- An attempt may only be admitted under a packet that still grants execution
+-- authority. A STALE or SUPERSEDED packet means execution must stop, so it
+-- must not be the basis for starting more of it. Expiry is checked in Go,
+-- since the stored timestamps are not in a format SQLite can compare against
+-- its own clock.
+CREATE TRIGGER trg_worker_attempt_packet_authority
+BEFORE INSERT ON worker_attempt
+FOR EACH ROW
+WHEN (SELECT status FROM execution_packet WHERE packet_id = NEW.packet_id) IS NOT 'APPROVED'
+BEGIN
+    SELECT RAISE(ABORT, 'an attempt requires a packet that grants execution authority');
+END;
+
 -- A finished task does not take on new work: a new attempt would occupy the
 -- repository's single modifying slot on behalf of a task that is over.
 CREATE TRIGGER trg_worker_attempt_task_not_terminal
@@ -471,6 +484,23 @@ BEGIN
     SELECT RAISE(ABORT, 'workspace identity must match its owning attempt');
 END;
 
+-- CC3's rule is a fresh isolated clone per modifying attempt, so the
+-- isolation kind is determined by the attempt's intent rather than chosen
+-- freely. Without this a MODIFYING attempt could own a READ_ONLY_CHECKOUT and
+-- still publish from it: the publish coherence trigger checks the attempt's
+-- intent, the workspace's owner and its base SHA, but not its isolation.
+CREATE TRIGGER trg_workspace_isolation_matches_intent
+BEFORE INSERT ON workspace
+FOR EACH ROW
+WHEN NEW.isolation_kind IS NOT (
+        CASE (SELECT intent FROM worker_attempt WHERE attempt_id = NEW.attempt_id)
+            WHEN 'MODIFYING' THEN 'ISOLATED_CLONE'
+            WHEN 'READ_ONLY' THEN 'READ_ONLY_CHECKOUT'
+        END)
+BEGIN
+    SELECT RAISE(ABORT, 'workspace isolation_kind must match the attempt intent');
+END;
+
 CREATE TRIGGER trg_workspace_ownership_immutable
 BEFORE UPDATE ON workspace
 FOR EACH ROW
@@ -531,7 +561,14 @@ CREATE TABLE publish_attempt (
     -- domain.ValidateTargetRef; the column keeps the load-bearing part.
     -- GLOB rather than LIKE for the symbolic-ref check: SQLite's LIKE is
     -- case-insensitive, which would reject every refs/heads/... target.
-    target_ref            TEXT NOT NULL CHECK (target_ref GLOB 'refs/*' AND target_ref NOT GLOB '*HEAD*' AND target_ref NOT LIKE '% %' AND target_ref NOT LIKE '%*%' AND target_ref NOT LIKE '%..%'),
+    -- GLOB rather than LIKE for the symbolic-ref check: SQLite's LIKE is
+    -- case-insensitive, which would reject every refs/heads/... target. Only
+    -- a whole trailing HEAD component is symbolic — a branch such as
+    -- refs/heads/fix-HEADER-parsing is an ordinary ref, and a substring match
+    -- would make it permanently unpublishable. The per-component rules of
+    -- git check-ref-format live in domain.ValidateTargetRef; the column keeps
+    -- the load-bearing part.
+    target_ref            TEXT NOT NULL CHECK (target_ref GLOB 'refs/*' AND target_ref NOT GLOB '*/HEAD' AND target_ref NOT LIKE '% %' AND target_ref NOT LIKE '%*%' AND target_ref NOT LIKE '%..%'),
 
     -- A retry of the same intent reproduces the same key and is rejected as a
     -- duplicate publication identity.
@@ -573,7 +610,7 @@ END;
 -- as rejected cannot be flipped to APPLIED and then used to complete a task.
 --
 -- PENDING   -> APPLIED | OBSERVED | REJECTED | UNKNOWN
--- APPLIED   -> OBSERVED | UNKNOWN
+-- APPLIED   -> OBSERVED
 -- UNKNOWN   -> APPLIED | OBSERVED | REJECTED
 -- OBSERVED, REJECTED are terminal.
 --

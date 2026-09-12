@@ -27,6 +27,9 @@ var ErrDuplicatePublishIdentity = errors.New("duplicate publish identity")
 // later work. Recording the binding now means the future publisher cannot be
 // written without one.
 func (t *Tx) RecordPublishAttempt(ctx context.Context, p domain.PublishAttempt) error {
+	if err := t.RequireOwnership(ctx); err != nil {
+		return err
+	}
 	// The idempotency key is the intent, so it is always recomputed here. A
 	// caller-chosen key would defeat the uniqueness constraint entirely: two
 	// keys for one intent are two publication identities, which is exactly
@@ -130,6 +133,62 @@ func (t *Tx) PublishAttempt(ctx context.Context, id ids.PublishAttemptID) (domai
 // is not a permitted transition.
 var ErrForbiddenPublishTransition = errors.New("forbidden publish status transition")
 
+// PublishAttemptByIdempotencyKey resolves a publication by its identity.
+//
+// This is the resolution half of the idempotency contract. Without it a
+// publisher restarting after a crash gets ErrDuplicatePublishIdentity with no
+// way to reach the intent that already exists and learn whether it was
+// applied — which is precisely the situation idempotency is for.
+func (t *Tx) PublishAttemptByIdempotencyKey(ctx context.Context, key string) (domain.PublishAttempt, error) {
+	if key == "" {
+		return domain.PublishAttempt{}, errors.New("idempotency key is empty")
+	}
+	var id string
+	err := t.tx.QueryRowContext(ctx,
+		`SELECT publish_attempt_id FROM publish_attempt WHERE idempotency_key = ?`, key).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.PublishAttempt{}, fmt.Errorf("%w: publication with idempotency key %s", ErrNotFound, key)
+	}
+	if err != nil {
+		return domain.PublishAttempt{}, fmt.Errorf("read publication by idempotency key: %w", err)
+	}
+	return t.PublishAttempt(ctx, ids.PublishAttemptID(id))
+}
+
+// PublishAttemptsForAttempt lists an attempt's publications, oldest first.
+func (t *Tx) PublishAttemptsForAttempt(ctx context.Context, attempt ids.AttemptID) ([]domain.PublishAttempt, error) {
+	rows, err := t.tx.QueryContext(ctx,
+		`SELECT publish_attempt_id FROM publish_attempt WHERE attempt_id = ? ORDER BY created_at, publish_attempt_id`,
+		string(attempt))
+	if err != nil {
+		return nil, fmt.Errorf("read publications for attempt: %w", err)
+	}
+	var identifiers []ids.PublishAttemptID
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan publication id: %w", err)
+		}
+		identifiers = append(identifiers, ids.PublishAttemptID(id))
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("iterate publications: %w", err)
+	}
+	rows.Close()
+
+	out := make([]domain.PublishAttempt, 0, len(identifiers))
+	for _, id := range identifiers {
+		pub, err := t.PublishAttempt(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, pub)
+	}
+	return out, nil
+}
+
 // SetPublishStatus moves a publication within PublishStatus.
 //
 // Only a permitted transition is accepted. Without this a publication
@@ -137,6 +196,9 @@ var ErrForbiddenPublishTransition = errors.New("forbidden publish status transit
 // task — the same "authority regained" move the packet transitions forbid.
 // The same rule is enforced by a schema trigger.
 func (t *Tx) SetPublishStatus(ctx context.Context, id ids.PublishAttemptID, status state.PublishStatus) error {
+	if err := t.RequireOwnership(ctx); err != nil {
+		return err
+	}
 	if err := status.Validate(); err != nil {
 		return err
 	}
@@ -163,6 +225,9 @@ func (t *Tx) SetPublishStatus(ctx context.Context, id ids.PublishAttemptID, stat
 // before the insert, and again by a schema trigger. Evidence about one attempt
 // can therefore never be filed under another.
 func (t *Tx) RecordEvidence(ctx context.Context, e domain.EvidenceObservation) error {
+	if err := t.RequireOwnership(ctx); err != nil {
+		return err
+	}
 	if err := e.Validate(); err != nil {
 		return err
 	}

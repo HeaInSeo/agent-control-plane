@@ -97,10 +97,18 @@ target, so "publish branch HEAD" cannot be represented, let alone executed.
 `domain.CheckPublishPreconditions` is the gate the future publisher must pass:
 current epoch, current attempt, matching fence, live attempt, owning workspace,
 unreleased workspace, matching repository subject, commit present in workspace,
-and the packet's authority — status and expiry — still holding. `Authorize`
-covers launch and resume; publication is the third moment where authority has
-to hold, because a packet can go stale, be superseded or expire while an
-attempt is mid-run, and publishing is the irreversible step.
+and the packet's authority — status and expiry — still holding. Packet
+authority is checked at all three moments it matters: `Authorize` at launch and
+resume, `CreateWorkerAttempt` at admission, and these preconditions at
+publication. A packet can go stale, be superseded or expire while an attempt is
+mid-run, and a packet that means "execution must stop" must not be the basis
+for starting more of it.
+
+A publication's identity is also resolvable, not only unique:
+`PublishAttemptByIdempotencyKey` and `PublishAttemptsForAttempt` let a
+publisher restarting after a crash reach the intent that already exists and
+learn its status, which is the half of idempotency that matters during
+recovery.
 
 M0 records intent. It does not push.
 
@@ -110,6 +118,13 @@ A contract in this milestone, enforced before the first real worker. See
 `docs/threat-boundary.md`.
 
 ### CC3 — workspace isolation
+
+The isolation kind is determined by the attempt's intent rather than chosen
+freely — `MODIFYING` requires an `ISOLATED_CLONE`, `READ_ONLY` a
+`READ_ONLY_CHECKOUT` — because otherwise a modifying attempt could own a
+read-only checkout and still publish from it: the publish coherence trigger
+checks the attempt's intent, the workspace's owner and its base SHA, but not
+its isolation.
 
 `IsolationKind` offers `ISOLATED_CLONE` and `READ_ONLY_CHECKOUT`. A shared Git
 worktree is not in the set, because worktrees share Git metadata with a process
@@ -123,6 +138,16 @@ relative `ws` are five distinct strings naming at most one directory, so
 without canonicalisation the constraint would not mean what it says.
 
 ### CC4 — SchedulerEpoch
+
+The fence runs in both directions. `RequireCurrentEpoch` asks whether a *row*
+belongs to the current generation; `RequireOwnership` asks whether the
+*caller* does. Without the second, a process still holding a read-write handle
+from a retired generation could drive the current generation's live attempt to
+`ABANDONED`, release its workspace, or mark its packet `STALE` — all writes
+that target current-epoch rows and so pass every row-level check. A handle
+acquires ownership by activating a scheduler and loses it the moment a later
+generation activates; a handle that never activated may read but not mutate
+execution state.
 
 `ActivateScheduler` is the only path that inserts an epoch. `Open`,
 `IntegrityCheck`, `VerifySchema`, `AppliedMigrations`, `Migrate` and every
@@ -314,6 +339,12 @@ transaction.
 
 WAL, a single connection matching the single-active-scheduler model, and
 `BEGIN IMMEDIATE` via `_txlock=immediate`.
+
+Open also refuses a database migrated beyond what the running build knows.
+`Migrate` and `VerifySchema` already do, but neither is on the Open path: a
+read-only inspector, a backup job or an integrity checker would otherwise read
+— and a read-write handle would write — a database carrying invariants this
+build has never heard of.
 
 `Config.Path` is resolved to an absolute path at open time. The DSN is a
 `file:` URI, and a relative path inside one is read as a URI authority rather

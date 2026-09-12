@@ -198,6 +198,9 @@ func (t *Tx) scanRepositorySubject(row *sql.Row, what string) (domain.Repository
 
 // ApprovePacket stores an approved execution packet.
 func (t *Tx) ApprovePacket(ctx context.Context, p domain.ExecutionPacket) error {
+	if err := t.RequireOwnership(ctx); err != nil {
+		return err
+	}
 	if err := p.Validate(); err != nil {
 		return err
 	}
@@ -309,6 +312,9 @@ func (t *Tx) Packet(ctx context.Context, id ids.PacketID) (domain.ExecutionPacke
 // is the only mutation an approved packet ever accepts. The same rule is
 // enforced by a schema trigger.
 func (t *Tx) SetPacketStatus(ctx context.Context, id ids.PacketID, status state.PacketStatus) error {
+	if err := t.RequireOwnership(ctx); err != nil {
+		return err
+	}
 	if err := status.Validate(); err != nil {
 		return err
 	}

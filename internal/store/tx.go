@@ -25,6 +25,9 @@ var (
 	// ErrAmbiguous means a lookup matched more than one row and cannot be
 	// resolved safely.
 	ErrAmbiguous = errors.New("lookup is ambiguous")
+	// ErrNoSchedulerOwnership means this handle never acquired scheduler
+	// ownership, so it may not mutate execution state.
+	ErrNoSchedulerOwnership = errors.New("handle has not acquired scheduler ownership")
 )
 
 // Tx is a transactional view of the store.
@@ -36,6 +39,39 @@ type Tx struct {
 	tx       *sql.Tx
 	now      func() time.Time
 	readOnly bool
+	// ownerEpoch is the generation this handle acquired ownership as, or 0 if
+	// it never activated a scheduler.
+	ownerEpoch domain.Epoch
+	// ownershipAssumed lets the activation transaction itself write, since it
+	// is the operation that establishes ownership in the first place.
+	ownershipAssumed bool
+}
+
+// RequireOwnership rejects a mutation by a handle that does not currently own
+// the scheduler.
+//
+// RequireCurrentEpoch asks whether a *row* belongs to the current generation.
+// This asks whether the *caller* does, which is the other half of the fence:
+// without it a process still holding a read-write handle from a retired
+// generation could drive the current generation's live attempt to ABANDONED,
+// release its workspace, or mark its packet STALE — all writes that target
+// current-epoch rows and so pass every row-level check.
+func (t *Tx) RequireOwnership(ctx context.Context) error {
+	if t.ownershipAssumed {
+		return nil
+	}
+	current, err := t.CurrentEpoch(ctx)
+	if err != nil {
+		return err
+	}
+	if t.ownerEpoch == 0 {
+		return fmt.Errorf("%w: current epoch is %d", ErrNoSchedulerOwnership, int64(current))
+	}
+	if t.ownerEpoch != current {
+		return fmt.Errorf("%w: this handle owns epoch %d, current epoch is %d",
+			ErrStaleEpoch, int64(t.ownerEpoch), int64(current))
+	}
+	return nil
 }
 
 // exec runs a statement that changes data.
@@ -55,9 +91,9 @@ func (t *Tx) Now() time.Time { return t.now().UTC() }
 // WithClock returns a handle that uses the given clock. It is intended for
 // tests that need deterministic timestamps.
 func (db *DB) WithClock(now func() time.Time) *DB {
-	clone := *db
+	clone := db.shallowCopy()
 	clone.clock = now
-	return &clone
+	return clone
 }
 
 func (db *DB) nowFunc() func() time.Time {
@@ -108,7 +144,13 @@ func (db *DB) runTx(ctx context.Context, readOnly bool, fn func(*Tx) error) (err
 		}
 	}()
 
-	if err := fn(&Tx{tx: sqlTx, now: db.nowFunc(), readOnly: readOnly}); err != nil {
+	if err := fn(&Tx{
+		tx:               sqlTx,
+		now:              db.nowFunc(),
+		readOnly:         readOnly,
+		ownerEpoch:       domain.Epoch(db.ownerEpoch.Load()),
+		ownershipAssumed: db.assumeOwnership,
+	}); err != nil {
 		return err
 	}
 	if err := sqlTx.Commit(); err != nil {
@@ -135,8 +177,13 @@ func (db *DB) ActivateScheduler(ctx context.Context, owner ids.SchedulerOwnerID,
 		return domain.SchedulerEpoch{}, errors.New("activate scheduler: reason is required")
 	}
 
+	// The activation transaction is the operation that establishes ownership,
+	// so it is the one write that cannot be gated on already having it.
+	activating := db.shallowCopy()
+	activating.assumeOwnership = true
+
 	var activated domain.SchedulerEpoch
-	err := db.Write(ctx, func(tx *Tx) error {
+	err := activating.Write(ctx, func(tx *Tx) error {
 		var current int64
 		err := tx.tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(epoch), 0) FROM scheduler_epoch`).Scan(&current)
 		if err != nil {
@@ -187,8 +234,13 @@ func (db *DB) ActivateScheduler(ctx context.Context, owner ids.SchedulerOwnerID,
 	if err != nil {
 		return domain.SchedulerEpoch{}, err
 	}
+	// Ownership is recorded only after the activation transaction committed.
+	db.ownerEpoch.Store(int64(activated.Epoch))
 	return activated, nil
 }
+
+// OwnedEpoch reports the generation this handle acquired ownership as, or 0.
+func (db *DB) OwnedEpoch() domain.Epoch { return domain.Epoch(db.ownerEpoch.Load()) }
 
 // CurrentEpoch returns the current scheduler ownership generation.
 func (db *DB) CurrentEpoch(ctx context.Context) (domain.Epoch, error) {

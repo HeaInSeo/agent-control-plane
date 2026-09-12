@@ -58,6 +58,12 @@ func validate(prefix, s string) error {
 	if _, err := hex.DecodeString(rest); err != nil {
 		return fmt.Errorf("%w: %q suffix is not hex", ErrMalformedID, s)
 	}
+	// hex.DecodeString accepts either case, so without this an identifier and
+	// its uppercase spelling would be two distinct primary keys for one
+	// 128-bit value. CommitSHA and Digest pin the case for the same reason.
+	if strings.ToLower(rest) != rest {
+		return fmt.Errorf("%w: %q suffix must be lowercase hex", ErrMalformedID, s)
+	}
 	return nil
 }
 

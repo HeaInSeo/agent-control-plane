@@ -23,6 +23,9 @@ func (t *Tx) AppendEvent(ctx context.Context, e domain.Event) (int64, error) {
 	if err := e.Validate(); err != nil {
 		return 0, err
 	}
+	if err := t.RequireOwnership(ctx); err != nil {
+		return 0, err
+	}
 	// History belongs to the generation that wrote it. A retired epoch's
 	// stream is closed: allowing appends to it would let a superseded
 	// scheduler add records to the replay stream EventsInEpoch reconstructs,

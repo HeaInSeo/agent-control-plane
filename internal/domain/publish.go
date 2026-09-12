@@ -101,8 +101,14 @@ func (p PublishAttempt) Validate() error {
 	return nil
 }
 
-// ValidateTargetRef requires a fully qualified ref name and rejects symbolic
-// or wildcard targets. "HEAD" as a target hides which ref actually moves.
+// ValidateTargetRef requires a fully qualified, non-symbolic ref name that
+// Git itself will accept.
+//
+// The rules follow git check-ref-format, applied per path component. Getting
+// this wrong in either direction costs something real: too loose and the
+// future publisher builds a push against a name Git refuses; too strict and a
+// legitimate branch becomes permanently unpublishable, because the schema
+// mirrors these rules and such a publication could never even be recorded.
 func ValidateTargetRef(ref string) error {
 	if ref == "" {
 		return fmt.Errorf("%w: target_ref is empty", ErrPublishTargetInvalid)
@@ -111,16 +117,64 @@ func ValidateTargetRef(ref string) error {
 		return fmt.Errorf("%w: target_ref %q must be a fully qualified ref (refs/...)",
 			ErrPublishTargetInvalid, ref)
 	}
-	if strings.Contains(ref, "HEAD") {
-		return fmt.Errorf("%w: target_ref %q must not be symbolic", ErrPublishTargetInvalid, ref)
+	if strings.HasSuffix(ref, "/") {
+		return fmt.Errorf("%w: target_ref %q ends with a separator", ErrPublishTargetInvalid, ref)
 	}
-	for _, bad := range []string{"*", "..", " ", "~", "^", ":", "?", "[", "\\"} {
-		if strings.Contains(ref, bad) {
-			return fmt.Errorf("%w: target_ref %q contains %q", ErrPublishTargetInvalid, ref, bad)
+	if strings.Contains(ref, "..") {
+		return fmt.Errorf("%w: target_ref %q contains %q", ErrPublishTargetInvalid, ref, "..")
+	}
+	if strings.Contains(ref, "@{") {
+		return fmt.Errorf("%w: target_ref %q contains %q", ErrPublishTargetInvalid, ref, "@{")
+	}
+
+	components := strings.Split(ref, "/")
+	for _, component := range components {
+		if err := validateRefComponent(ref, component); err != nil {
+			return err
 		}
 	}
-	if strings.HasSuffix(ref, "/") || strings.HasSuffix(ref, ".lock") {
-		return fmt.Errorf("%w: target_ref %q has an invalid suffix", ErrPublishTargetInvalid, ref)
+	// Only a whole component named HEAD is symbolic. A branch such as
+	// refs/heads/fix-HEADER-parsing is an ordinary ref, and rejecting it on a
+	// substring match would make it unpublishable for ever.
+	if components[len(components)-1] == "HEAD" {
+		return fmt.Errorf("%w: target_ref %q must not be symbolic", ErrPublishTargetInvalid, ref)
+	}
+	return nil
+}
+
+// refBadChars are the characters git check-ref-format rejects outright.
+const refBadChars = " ~^:?*[\\"
+
+// validateRefComponent applies the per-component rules of git check-ref-format.
+func validateRefComponent(ref, component string) error {
+	if component == "" {
+		return fmt.Errorf("%w: target_ref %q has an empty path component", ErrPublishTargetInvalid, ref)
+	}
+	if strings.HasPrefix(component, ".") {
+		return fmt.Errorf("%w: target_ref %q has a component starting with %q",
+			ErrPublishTargetInvalid, ref, ".")
+	}
+	if strings.HasSuffix(component, ".") {
+		return fmt.Errorf("%w: target_ref %q has a component ending with %q",
+			ErrPublishTargetInvalid, ref, ".")
+	}
+	if strings.HasSuffix(component, ".lock") {
+		return fmt.Errorf("%w: target_ref %q has a component ending with %q",
+			ErrPublishTargetInvalid, ref, ".lock")
+	}
+	if component == "@" {
+		return fmt.Errorf("%w: target_ref %q has a component that is just %q",
+			ErrPublishTargetInvalid, ref, "@")
+	}
+	if strings.ContainsAny(component, refBadChars) {
+		return fmt.Errorf("%w: target_ref %q contains a character Git rejects",
+			ErrPublishTargetInvalid, ref)
+	}
+	for _, r := range component {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("%w: target_ref %q contains a control character",
+				ErrPublishTargetInvalid, ref)
+		}
 	}
 	return nil
 }

@@ -271,9 +271,37 @@ no key to match on.
 
 | Gap | Required before |
 | --- | --- |
+| A completed task still holds its repository's modifying slot — escalated, see below | resolution before M1 admission |
 | OS-level worker isolation and credential fence | first real worker (M2) |
 | Worker push-isolation test | first real worker (M2) |
 | Publisher with exact-SHA enforcement | first remote mutation (M3) |
 | GitHub reconciliation of repository identity and effects | autonomous admission |
 | Lease expiry, takeover and crash recovery | autonomous execution |
 | Repository governance on this repository itself | autonomous mutation of it |
+
+## Open architecture contradiction
+
+**A successfully completed task leaves a live attempt holding its
+repository's modifying slot.**
+
+Completion requires the evidence to come from a non-terminal attempt, which is
+what stops a fenced-out attempt from completing work a successor is running.
+But `WorkerAttemptStatus` has no success-flavoured terminal state: `FAILED`,
+`ABANDONED` and `EVIDENCE_UNKNOWN` all describe a failure. So after a task
+completes, its attempt is still live and still occupies the single per-
+`RepositorySubject` modifying slot, and the only way to free that slot is to
+record a successful attempt as a failed one — which would falsify the durable
+record the control plane exists to keep.
+
+Two candidate resolutions, both of which change a contract specified in the
+M0 packet:
+
+1. Add a terminal, non-failure `WorkerAttemptStatus` (a `SUCCEEDED`), which
+   extends a state domain the packet enumerates.
+2. Redefine the CC9 slot as "a live attempt of a non-terminal task", which
+   means the exclusion can no longer be a partial unique index — it becomes a
+   trigger that joins to `task_run`.
+
+Neither is taken unilaterally. `TestCompletedTaskStillHoldsModifyingSlot_KnownEscalation`
+pins the current constrained behaviour so the gap is visible rather than
+latent, and will fail if the behaviour changes.

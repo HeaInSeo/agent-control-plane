@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver; no cgo, no system libsqlite
@@ -96,6 +97,15 @@ type DB struct {
 	mode  Mode
 	path  string
 	clock func() time.Time
+
+	// ownerEpoch is the scheduler generation this handle activated, or 0 if it
+	// never did. Mutating execution state requires owning the current
+	// generation, so a handle from a retired generation is fenced out in both
+	// directions: it cannot act on old rows, and it cannot act on new ones.
+	ownerEpoch atomic.Int64
+	// assumeOwnership is set only on the internal handle the activation
+	// transaction runs under, since that is what establishes ownership.
+	assumeOwnership bool
 }
 
 // Open validates and opens the control plane database.
@@ -166,8 +176,44 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 			_ = sqlDB.Close()
 			return nil, err
 		}
+		// Fail closed on a database written by a newer build. Migrate and
+		// VerifySchema already refuse one, but neither is on the Open path: a
+		// read-only inspector, a backup job or an integrity checker would
+		// otherwise read — and a read-write handle would write — a database
+		// carrying invariants this build does not know about.
+		if err := db.rejectNewerSchema(ctx); err != nil {
+			_ = sqlDB.Close()
+			return nil, err
+		}
 	}
 	return db, nil
+}
+
+// rejectNewerSchema refuses a database migrated beyond what this build knows.
+//
+// Only the "newer than supported" case is checked here. Full history
+// verification — contiguity, names, checksums — belongs to Migrate and
+// VerifySchema, which callers that intend to migrate or audit will run; this
+// is the check every caller needs, whatever it came to do.
+func (db *DB) rejectNewerSchema(ctx context.Context) error {
+	applied, err := db.AppliedMigrations(ctx)
+	if err != nil {
+		return err
+	}
+	if len(applied) == 0 {
+		return nil
+	}
+	known, err := Migrations()
+	if err != nil {
+		return err
+	}
+	highestApplied := applied[len(applied)-1].Version
+	highestKnown := known[len(known)-1].Version
+	if highestApplied > highestKnown {
+		return fmt.Errorf("%w: %s is at version %d, this build knows up to %d",
+			ErrSchemaVersionUnsupported, db.path, highestApplied, highestKnown)
+	}
+	return nil
 }
 
 // dsn builds the driver connection string.
@@ -385,6 +431,23 @@ func inspectFile(path string) (fileState, error) {
 		return fileAbsent, fmt.Errorf("%w: %s has an unexpected file header", ErrNotSQLiteDatabase, path)
 	}
 	return fileDatabase, nil
+}
+
+// shallowCopy returns a handle sharing the same connection and ownership.
+//
+// atomic.Int64 must not be copied by value, so the ownership generation is
+// carried across explicitly. The copy shares the underlying *sql.DB, which is
+// the point: it is the same database handle with one field changed.
+func (db *DB) shallowCopy() *DB {
+	clone := &DB{
+		sql:             db.sql,
+		mode:            db.mode,
+		path:            db.path,
+		clock:           db.clock,
+		assumeOwnership: db.assumeOwnership,
+	}
+	clone.ownerEpoch.Store(db.ownerEpoch.Load())
+	return clone
 }
 
 // Mode reports the handle's access mode.
