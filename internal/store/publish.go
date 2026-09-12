@@ -39,6 +39,19 @@ func (t *Tx) RecordPublishAttempt(ctx context.Context, p domain.PublishAttempt) 
 	}
 	p.IdempotencyKey = derived
 
+	// A publication intent starts at the beginning of its lifecycle. The
+	// transition triggers only constrain UPDATE, so without this a row could
+	// be inserted already OBSERVED — a durable record claiming the effect was
+	// independently observed although no lifecycle was ever traversed, and
+	// immediately usable to complete a modifying task.
+	if p.Status == "" {
+		p.Status = state.PublishPending
+	}
+	if p.Status != state.PublishPending {
+		return fmt.Errorf("%w: a publication must be recorded as %q, not %q",
+			domain.ErrPublishBindingInvalid, string(state.PublishPending), string(p.Status))
+	}
+
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = t.Now()
 	}

@@ -1102,6 +1102,9 @@ func TestPublishPreconditionsRejectStaleBinding(t *testing.T) {
 		WorkspaceReleased:     false,
 		RepositorySubjectID:   f.Subject.RepositorySubjectID,
 		CommitInWorkspace:     true,
+		PacketStatus:          state.PacketApproved,
+		PacketExpiresAt:       f.Packet.ExpiresAt,
+		Now:                   fixedNow,
 	}
 	if err := domain.CheckPublishPreconditions(pub, live); err != nil {
 		t.Fatalf("a coherent publication was rejected: %v", err)
@@ -1148,6 +1151,44 @@ func TestPublishPreconditionsRejectStaleBinding(t *testing.T) {
 			}
 		})
 	}
+
+	// The packet must still carry authority at the moment of publication, not
+	// only at launch and resume.
+	t.Run("packet went stale mid-run", func(t *testing.T) {
+		stale := live
+		stale.PacketStatus = state.PacketStale
+		if err := domain.CheckPublishPreconditions(pub, stale); !errors.Is(err, domain.ErrPacketNoAuthority) {
+			t.Fatalf("want ErrPacketNoAuthority, got %v", err)
+		}
+	})
+	t.Run("packet was superseded mid-run", func(t *testing.T) {
+		superseded := live
+		superseded.PacketStatus = state.PacketSuperseded
+		if err := domain.CheckPublishPreconditions(pub, superseded); !errors.Is(err, domain.ErrPacketNoAuthority) {
+			t.Fatalf("want ErrPacketNoAuthority, got %v", err)
+		}
+	})
+	t.Run("packet expired mid-run", func(t *testing.T) {
+		expired := live
+		expired.Now = f.Packet.ExpiresAt
+		if err := domain.CheckPublishPreconditions(pub, expired); !errors.Is(err, domain.ErrPacketExpired) {
+			t.Fatalf("want ErrPacketExpired, got %v", err)
+		}
+	})
+	t.Run("packet authority unset fails closed", func(t *testing.T) {
+		for _, mutate := range []func(domain.PublishPreconditions) domain.PublishPreconditions{
+			func(p domain.PublishPreconditions) domain.PublishPreconditions { p.PacketStatus = ""; return p },
+			func(p domain.PublishPreconditions) domain.PublishPreconditions { p.Now = time.Time{}; return p },
+			func(p domain.PublishPreconditions) domain.PublishPreconditions {
+				p.PacketExpiresAt = time.Time{}
+				return p
+			},
+		} {
+			if err := domain.CheckPublishPreconditions(pub, mutate(live)); err == nil {
+				t.Fatal("an unset precondition was accepted")
+			}
+		}
+	})
 }
 
 func TestExpiredPacketCannotAuthorizeExecution(t *testing.T) {

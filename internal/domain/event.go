@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -285,25 +286,44 @@ func EncodeFields(in map[string]any) (string, error) {
 
 // normaliseFields round-trips fields through JSON so that every value is a
 // plain map, slice or scalar before redaction inspects it.
+//
+// Numbers are decoded as json.Number, not float64. Decoding into float64
+// would silently corrupt any integer beyond 2^53 — a nanosecond timestamp, a
+// byte count, a numeric external id — and event history is append-only, so a
+// number mangled on the way in can never be corrected.
 func normaliseFields(in map[string]any) (map[string]any, error) {
 	encoded, err := json.Marshal(in)
 	if err != nil {
 		return nil, fmt.Errorf("encode event fields: %w", err)
 	}
-	var out map[string]any
-	if err := json.Unmarshal(encoded, &out); err != nil {
+	out, err := decodeJSONObject(encoded)
+	if err != nil {
 		return nil, fmt.Errorf("normalise event fields: %w", err)
 	}
 	return out, nil
 }
 
+// decodeJSONObject decodes a JSON object, preserving numeric literals exactly.
+func decodeJSONObject(encoded []byte) (map[string]any, error) {
+	dec := json.NewDecoder(bytes.NewReader(encoded))
+	dec.UseNumber()
+	var out map[string]any
+	if err := dec.Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // DecodeFields deserialises stored event fields.
+//
+// Numbers come back as json.Number so that a value read out of history is the
+// value that was stored, rather than a float64 approximation of it.
 func DecodeFields(s string) (map[string]any, error) {
 	if s == "" || s == "{}" {
 		return nil, nil
 	}
-	var out map[string]any
-	if err := json.Unmarshal([]byte(s), &out); err != nil {
+	out, err := decodeJSONObject([]byte(s))
+	if err != nil {
 		return nil, fmt.Errorf("decode event fields: %w", err)
 	}
 	return out, nil

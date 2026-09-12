@@ -23,6 +23,14 @@ func (t *Tx) AppendEvent(ctx context.Context, e domain.Event) (int64, error) {
 	if err := e.Validate(); err != nil {
 		return 0, err
 	}
+	// History belongs to the generation that wrote it. A retired epoch's
+	// stream is closed: allowing appends to it would let a superseded
+	// scheduler add records to the replay stream EventsInEpoch reconstructs,
+	// which is the same objection that keeps attempts, publications, evidence
+	// and completions bound to the current epoch.
+	if err := t.RequireCurrentEpoch(ctx, e.SchedulerEpoch); err != nil {
+		return 0, err
+	}
 
 	var last int64
 	if err := t.tx.QueryRowContext(ctx,
@@ -129,6 +137,9 @@ func (t *Tx) EventsInEpoch(ctx context.Context, epoch domain.Epoch) ([]domain.Ev
 // callers use AppendEvent and let the store allocate.
 func (t *Tx) AppendEventAt(ctx context.Context, e domain.Event, seq int64) error {
 	if err := e.Validate(); err != nil {
+		return err
+	}
+	if err := t.RequireCurrentEpoch(ctx, e.SchedulerEpoch); err != nil {
 		return err
 	}
 	fields, err := domain.EncodeFields(e.Fields)

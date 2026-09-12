@@ -96,7 +96,11 @@ a 40-hex lowercase commit name and a fully qualified, non-symbolic `refs/...`
 target, so "publish branch HEAD" cannot be represented, let alone executed.
 `domain.CheckPublishPreconditions` is the gate the future publisher must pass:
 current epoch, current attempt, matching fence, live attempt, owning workspace,
-unreleased workspace, matching repository subject, commit present in workspace.
+unreleased workspace, matching repository subject, commit present in workspace,
+and the packet's authority — status and expiry — still holding. `Authorize`
+covers launch and resume; publication is the third moment where authority has
+to hold, because a packet can go stale, be superseded or expire while an
+attempt is mid-run, and publishing is the irreversible step.
 
 M0 records intent. It does not push.
 
@@ -245,7 +249,7 @@ task:
 
 ```text
 PENDING  -> APPLIED | OBSERVED | REJECTED | UNKNOWN
-APPLIED  -> OBSERVED | UNKNOWN
+APPLIED  -> OBSERVED
 UNKNOWN  -> APPLIED | OBSERVED | REJECTED
 OBSERVED, REJECTED are terminal
 ```
@@ -255,6 +259,36 @@ remote mutation lands but before recording `APPLIED`, and later reconciliation
 then observes the effect directly. `UNKNOWN` is the one state still open to
 resolution — it means the outcome could not be determined, not that it
 succeeded, and it never completes a task.
+
+`APPLIED -> UNKNOWN` is deliberately absent. `APPLIED` already records that
+the remote mutation was made, so the step would discard information — and
+since `UNKNOWN -> REJECTED` is permitted, `APPLIED -> UNKNOWN -> REJECTED`
+would let a publication that actually landed end up permanently recorded as
+"nothing was published". `REJECTED` is terminal and the idempotency key is
+unique, so that record could never be corrected. A reconciler that cannot
+confirm an applied publication leaves it `APPLIED`.
+
+A publication is also always recorded at `PENDING`. The transition rules
+constrain updates, so without that a row could be inserted already `OBSERVED`
+— a durable claim that the effect was independently observed, with no
+lifecycle ever traversed, immediately usable to complete a task.
+
+`TaskRunStatus` completes the set:
+
+```text
+READY          -> RUNNING | BLOCKED_DESIGN | COMPLETED | ABANDONED
+RUNNING        -> READY | BLOCKED_DESIGN | COMPLETED | ABANDONED
+BLOCKED_DESIGN -> READY | RUNNING | ABANDONED
+COMPLETED, ABANDONED are terminal
+```
+
+A task may cycle between the live states as attempts come and go and as design
+questions block and unblock it, but an explicitly withdrawn task is not
+re-admitted and a completed one is not reopened. A terminal task also cannot
+admit a new attempt or change its current attempt: doing so would occupy the
+repository's single modifying slot on behalf of a task that is over, and would
+move `current_attempt_id` away from the attempt whose evidence established
+completion.
 
 ### CC9 — lane-agnostic modifying admission
 
@@ -320,6 +354,14 @@ consistency check. A database migrated beyond what the running build knows
 fails with `ErrSchemaVersionUnsupported` rather than being treated as close
 enough. Each migration runs inside one transaction together with its own
 ledger entry, so a step can never be recorded as applied when it was not.
+
+Event fields are normalised through JSON before redaction so that redaction
+sees the shape that will be stored, and numbers are decoded as `json.Number`
+rather than `float64`. Decoding into `float64` would silently corrupt any
+integer beyond 2^53 — a nanosecond timestamp, a byte count, a numeric external
+id — and event history is append-only, so a number mangled on the way in could
+never be corrected. Reads decode the same way, so a value read out of history
+is the value that was stored.
 
 Bootstrap — the database identity marker plus the migration ledger — is a
 single transaction that runs before any migration. The two must be created

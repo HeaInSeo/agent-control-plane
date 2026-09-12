@@ -37,3 +37,10 @@ func (db *DB) RecycleConnectionsForTest() {
 	db.sql.SetMaxIdleConns(0)
 	db.sql.SetMaxIdleConns(1)
 }
+
+// QueryStringForTest runs a scalar text query inside the transaction.
+func (t *Tx) QueryStringForTest(ctx context.Context, query string, args ...any) (string, error) {
+	var out string
+	err := t.tx.QueryRowContext(ctx, query, args...).Scan(&out)
+	return out, err
+}

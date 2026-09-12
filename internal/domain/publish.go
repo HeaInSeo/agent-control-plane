@@ -166,6 +166,16 @@ type PublishPreconditions struct {
 	WorkspaceReleased     bool
 	RepositorySubjectID   ids.RepositorySubjectID
 	CommitInWorkspace     bool
+
+	// PacketStatus and PacketExpiresAt are the authority the publication is
+	// made under. Packet.Authorize covers launch and resume; publication is
+	// the third moment where authority has to still hold, because a packet
+	// can be marked STALE, be superseded, or expire while an attempt is
+	// mid-run. Publishing is the irreversible step, so it revalidates too.
+	PacketStatus    state.PacketStatus
+	PacketExpiresAt time.Time
+	// Now is the instant the preconditions are evaluated at.
+	Now time.Time
 }
 
 // CheckPublishPreconditions rejects any publication whose binding no longer
@@ -207,6 +217,20 @@ func CheckPublishPreconditions(p PublishAttempt, live PublishPreconditions) erro
 	if !live.CommitInWorkspace {
 		return fmt.Errorf("%w: source_commit_sha %s is not reachable in workspace %s",
 			ErrPublishBindingInvalid, string(p.SourceCommitSHA), string(p.WorkspaceID))
+	}
+	if !live.PacketStatus.GrantsExecutionAuthority() {
+		return fmt.Errorf("%w: packet status is %q",
+			ErrPacketNoAuthority, string(live.PacketStatus))
+	}
+	if live.Now.IsZero() {
+		return fmt.Errorf("%w: precondition evaluation time is unset", ErrPublishBindingInvalid)
+	}
+	if live.PacketExpiresAt.IsZero() {
+		return fmt.Errorf("%w: packet expiry is unset", ErrPublishBindingInvalid)
+	}
+	if !live.Now.Before(live.PacketExpiresAt) {
+		return fmt.Errorf("%w: packet expired at %s, now %s",
+			ErrPacketExpired, live.PacketExpiresAt.UTC(), live.Now.UTC())
 	}
 	return nil
 }

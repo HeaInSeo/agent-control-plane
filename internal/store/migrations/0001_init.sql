@@ -237,6 +237,24 @@ BEGIN
     SELECT RAISE(ABORT, 'completion evidence must be attributed to this task');
 END;
 
+-- Permitted task status transitions only. READY, RUNNING and BLOCKED_DESIGN
+-- may cycle as attempts come and go and as design questions block and unblock
+-- the task; COMPLETED and ABANDONED are terminal. An explicitly withdrawn
+-- task must not be silently re-admitted for execution, and a completed one
+-- must not be reopened.
+CREATE TRIGGER trg_task_run_status_transition
+BEFORE UPDATE OF status ON task_run
+FOR EACH ROW
+WHEN NEW.status IS NOT OLD.status
+ AND NOT (
+        (OLD.status = 'READY'          AND NEW.status IN ('RUNNING', 'BLOCKED_DESIGN', 'COMPLETED', 'ABANDONED'))
+     OR (OLD.status = 'RUNNING'        AND NEW.status IN ('READY', 'BLOCKED_DESIGN', 'COMPLETED', 'ABANDONED'))
+     OR (OLD.status = 'BLOCKED_DESIGN' AND NEW.status IN ('READY', 'RUNNING', 'ABANDONED'))
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'forbidden task run status transition');
+END;
+
 -- A task may only point at an attempt that belongs to it.
 CREATE TRIGGER trg_task_run_current_attempt_binding_ins
 BEFORE INSERT ON task_run
@@ -274,6 +292,18 @@ WHEN NEW.current_attempt_id IS NOT NULL
   )
 BEGIN
     SELECT RAISE(ABORT, 'current_attempt_id must move forward to a live attempt');
+END;
+
+-- Once a task is finished its current attempt is settled. Moving the pointer
+-- afterwards would separate the task from the attempt whose evidence
+-- established completion.
+CREATE TRIGGER trg_task_run_current_attempt_frozen_when_terminal
+BEFORE UPDATE OF current_attempt_id ON task_run
+FOR EACH ROW
+WHEN OLD.status IN ('COMPLETED', 'ABANDONED')
+ AND NEW.current_attempt_id IS NOT OLD.current_attempt_id
+BEGIN
+    SELECT RAISE(ABORT, 'a terminal task cannot change its current attempt');
 END;
 
 -- #5: completion evidence, once bound, is the observation that established
@@ -345,6 +375,16 @@ WHEN (SELECT repository_subject_id FROM task_run WHERE task_id = NEW.task_id) IS
 BEGIN
     SELECT RAISE(ABORT, 'worker_attempt identity must match its task_run');
 END;
+-- A finished task does not take on new work: a new attempt would occupy the
+-- repository's single modifying slot on behalf of a task that is over.
+CREATE TRIGGER trg_worker_attempt_task_not_terminal
+BEFORE INSERT ON worker_attempt
+FOR EACH ROW
+WHEN (SELECT status FROM task_run WHERE task_id = NEW.task_id) IN ('COMPLETED', 'ABANDONED')
+BEGIN
+    SELECT RAISE(ABORT, 'a terminal task cannot admit a new attempt');
+END;
+
 
 CREATE TRIGGER trg_worker_attempt_fence_monotonic
 BEFORE INSERT ON worker_attempt
@@ -449,6 +489,19 @@ BEGIN
     SELECT RAISE(ABORT, 'workspace ownership is immutable; a workspace cannot be rebound to another attempt');
 END;
 
+-- released_at is the one mutable column, and it only moves forward: from NULL
+-- to a timestamp, once. Resetting it to NULL would make a released workspace
+-- read as live again, defeating both released-workspace guards; overwriting
+-- it would lose when the workspace actually stopped being usable.
+CREATE TRIGGER trg_workspace_release_is_final
+BEFORE UPDATE OF released_at ON workspace
+FOR EACH ROW
+WHEN OLD.released_at IS NOT NULL
+ AND NEW.released_at IS NOT OLD.released_at
+BEGIN
+    SELECT RAISE(ABORT, 'workspace release is final');
+END;
+
 CREATE TRIGGER trg_workspace_no_delete
 BEFORE DELETE ON workspace
 BEGIN
@@ -533,7 +586,10 @@ FOR EACH ROW
 WHEN NEW.status IS NOT OLD.status
  AND NOT (
         (OLD.status = 'PENDING' AND NEW.status IN ('APPLIED', 'OBSERVED', 'REJECTED', 'UNKNOWN'))
-     OR (OLD.status = 'APPLIED' AND NEW.status IN ('OBSERVED', 'UNKNOWN'))
+     -- Deliberately not APPLIED -> UNKNOWN: combined with
+     -- UNKNOWN -> REJECTED it would let a landed publication be recorded
+     -- permanently as "nothing was published", uncorrectably.
+     OR (OLD.status = 'APPLIED' AND NEW.status = 'OBSERVED')
      OR (OLD.status = 'UNKNOWN' AND NEW.status IN ('APPLIED', 'OBSERVED', 'REJECTED'))
  )
 BEGIN

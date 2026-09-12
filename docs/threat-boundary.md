@@ -111,7 +111,14 @@ Defences in M0:
   ability to complete anything.
 - A publication that was recorded `REJECTED` cannot be flipped back to
   `APPLIED` and then used to complete a task; `OBSERVED` and `REJECTED` are
-  terminal and nothing returns to `PENDING`.
+  terminal and nothing returns to `PENDING`. Nor can an `APPLIED` publication
+  regress to `UNKNOWN` and from there be recorded `REJECTED`, which would
+  leave a publication that actually landed permanently recorded as never
+  having happened.
+- A publication is always recorded at `PENDING`, so no row can be inserted
+  already claiming an observed effect.
+- A withdrawn or completed task cannot be re-admitted, and a terminal task
+  cannot take a new attempt or change its current attempt.
 - The default effect rule is exact SHA equality, not ancestor-or-equal.
 - For modifying work, completion additionally requires a publication binding
   whose status is `APPLIED` or `OBSERVED`.
@@ -124,6 +131,9 @@ Defences in M0:
   even partially.
 - Evidence rows are immutable once written, which is what makes the artifact
   digest a binding rather than a note.
+- A workspace release is final: it cannot be reset to live, which would defeat
+  both released-workspace guards, nor overwritten, which would lose when the
+  workspace stopped being usable.
 
 ## Stale scheduler acting as the owner
 
@@ -133,8 +143,10 @@ partition or takeover — continues to admit attempts or publish.
 Defences in M0:
 
 - Ownership is a singleton row whose `current_epoch` may only move forward.
-- Attempts, publications, evidence observations and completions must all bind
-  the current epoch. Admission and publication are enforced in Go and by
+- Attempts, publications, evidence observations, completions and appended
+  history must all bind the current epoch. A retired generation's `(epoch,
+  seq)` stream is closed, so a superseded scheduler cannot add records to the
+  replay stream. Admission and publication are enforced in Go and by
   trigger; evidence and completion are enforced in Go, because the schema can
   only see that an observation matches its own attempt's epoch, which a
   retired attempt satisfies trivially.

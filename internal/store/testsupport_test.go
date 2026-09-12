@@ -244,3 +244,52 @@ func eventFor(epoch domain.Epoch, typ string) domain.Event {
 		Fields:         map[string]any{"note": fmt.Sprintf("%s in epoch %d", typ, int64(epoch))},
 	}
 }
+
+// preconditionFixture is a coherent publication plus the live state it would
+// be validated against.
+type preconditionFixture struct {
+	pub  domain.PublishAttempt
+	live domain.PublishPreconditions
+}
+
+// fixtureForPreconditions builds a coherent publication and matching live
+// state without needing a database.
+func fixtureForPreconditions() preconditionFixture {
+	taskID := ids.NewTaskID()
+	attemptID := ids.NewAttemptID()
+	workspaceID := ids.NewWorkspaceID()
+	subjectID := ids.NewRepositorySubjectID()
+
+	pub := domain.PublishAttempt{
+		PublishAttemptID:    ids.NewPublishAttemptID(),
+		TaskID:              taskID,
+		AttemptID:           attemptID,
+		SchedulerEpoch:      1,
+		FenceEpoch:          1,
+		WorkspaceID:         workspaceID,
+		RepositorySubjectID: subjectID,
+		BaseSHA:             sha("precondition-base"),
+		SourceCommitSHA:     sha("precondition-source"),
+		TargetRef:           "refs/heads/m0/preconditions",
+		Status:              state.PublishPending,
+		CreatedAt:           fixedNow,
+	}
+	pub.IdempotencyKey = domain.DeriveIdempotencyKey(pub)
+
+	return preconditionFixture{
+		pub: pub,
+		live: domain.PublishPreconditions{
+			CurrentSchedulerEpoch: 1,
+			TaskCurrentAttemptID:  attemptID,
+			AttemptStatus:         state.AttemptVerifying,
+			AttemptFenceEpoch:     1,
+			WorkspaceAttemptID:    attemptID,
+			WorkspaceReleased:     false,
+			RepositorySubjectID:   subjectID,
+			CommitInWorkspace:     true,
+			PacketStatus:          state.PacketApproved,
+			PacketExpiresAt:       fixedNow.Add(24 * time.Hour),
+			Now:                   fixedNow,
+		},
+	}
+}

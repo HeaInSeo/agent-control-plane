@@ -18,6 +18,10 @@ var ErrCompletionNotDerivable = errors.New("task completion is not derivable")
 // ErrInvalidTaskRun is returned when a task run mutation is incoherent.
 var ErrInvalidTaskRun = errors.New("invalid task run mutation")
 
+// ErrForbiddenTaskTransition is returned when a task status change is not a
+// permitted transition.
+var ErrForbiddenTaskTransition = errors.New("forbidden task run status transition")
+
 // ---------------------------------------------------------------------------
 // TaskRun
 // ---------------------------------------------------------------------------
@@ -121,6 +125,14 @@ func (t *Tx) SetTaskRunStatus(ctx context.Context, id ids.TaskID, status state.T
 		return fmt.Errorf("%w: COMPLETED must be derived from evidence via CompleteTaskRunFromEvidence, "+
 			"not written directly (worker exit is not completion)", ErrCompletionNotDerivable)
 	}
+	current, err := t.TaskRun(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !current.Status.CanTransitionTo(status) {
+		return fmt.Errorf("%w: task %s cannot move from %q to %q",
+			ErrForbiddenTaskTransition, string(id), string(current.Status), string(status))
+	}
 	return t.exactlyOne(ctx, "task run", string(id),
 		`UPDATE task_run SET status = ?, updated_at = ? WHERE task_id = ?`,
 		string(status), formatTime(t.Now()), string(id))
@@ -152,6 +164,14 @@ func (t *Tx) SetTaskCurrentAttempt(ctx context.Context, id ids.TaskID, attempt i
 	run, err := t.TaskRun(ctx, id)
 	if err != nil {
 		return err
+	}
+	// A finished task does not take on new work. Letting it would occupy the
+	// repository's single modifying slot on behalf of a task that is over,
+	// and would move current_attempt_id away from the attempt whose evidence
+	// established completion.
+	if run.Status.IsTerminal() {
+		return fmt.Errorf("%w: task %s is %s and cannot take a new current attempt",
+			ErrInvalidTaskRun, string(id), string(run.Status))
 	}
 	if run.CurrentAttemptID != nil {
 		previous, err := t.WorkerAttempt(ctx, *run.CurrentAttemptID)
@@ -292,6 +312,14 @@ func (t *Tx) CreateWorkerAttempt(ctx context.Context, a domain.WorkerAttempt) er
 	}
 	if err := t.RequireCurrentEpoch(ctx, a.SchedulerEpoch); err != nil {
 		return err
+	}
+	run, err := t.TaskRun(ctx, a.TaskID)
+	if err != nil {
+		return err
+	}
+	if run.Status.IsTerminal() {
+		return fmt.Errorf("%w: task %s is %s and cannot admit a new attempt",
+			ErrInvalidTaskRun, string(a.TaskID), string(run.Status))
 	}
 	now := t.Now()
 	if a.CreatedAt.IsZero() {
@@ -480,7 +508,18 @@ func (t *Tx) scanWorkspace(row *sql.Row, what string) (domain.Workspace, error) 
 
 // ReleaseWorkspace marks a workspace as no longer usable. A released workspace
 // can never be selected for publication.
+//
+// Releasing an already-released workspace is a no-op rather than a second
+// write: the first release is when the workspace stopped being usable, and
+// overwriting that timestamp would lose it.
 func (t *Tx) ReleaseWorkspace(ctx context.Context, id ids.WorkspaceID) error {
+	existing, err := t.Workspace(ctx, id)
+	if err != nil {
+		return err
+	}
+	if existing.ReleasedAt != nil {
+		return nil
+	}
 	return t.exactlyOne(ctx, "workspace", string(id),
 		`UPDATE workspace SET released_at = ? WHERE workspace_id = ?`,
 		formatTime(t.Now()), string(id))

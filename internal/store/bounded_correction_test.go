@@ -13,6 +13,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -460,7 +461,7 @@ func TestBC3RedactionDescendsThroughLists(t *testing.T) {
 		if stored.Fields["credentials"] != domain.Redacted {
 			t.Fatalf("a sensitive key holding a container was descended into: %v", stored.Fields["credentials"])
 		}
-		if stored.Fields["attempt"] != float64(3) {
+		if fmt.Sprint(stored.Fields["attempt"]) != "3" {
 			t.Fatalf("non-sensitive scalar was altered: %v", stored.Fields["attempt"])
 		}
 		return nil

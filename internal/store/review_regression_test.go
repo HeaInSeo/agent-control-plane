@@ -6,6 +6,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -254,17 +255,17 @@ func TestRedactionDoesNotDestroyOrdinaryFieldNames(t *testing.T) {
 			t.Fatal("appended event not found")
 		}
 
-		preserved := map[string]any{
+		preserved := map[string]string{
 			"root_path":     "/var/lib/acp/workspaces/ws-1",
 			"patch":         "diff --git a/x b/x",
 			"compat":        "v0.1",
 			"pattern":       "refs/heads/*",
 			"dispatch":      "manual",
-			"path_segments": float64(4),
+			"path_segments": "4",
 		}
 		for key, want := range preserved {
-			if stored[key] != want {
-				t.Fatalf("field %q was destroyed: got %v, want %v", key, stored[key], want)
+			if got := fmt.Sprint(stored[key]); got != want {
+				t.Fatalf("field %q was destroyed: got %v, want %v", key, got, want)
 			}
 		}
 		for _, key := range []string{"github_pat", "githubPat", "pat", "pat.value"} {

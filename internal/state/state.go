@@ -29,6 +29,9 @@ const (
 )
 
 // TaskRunStatus is the scheduling state of a TaskRun.
+//
+// COMPLETED and ABANDONED are terminal. A withdrawn task is not re-admitted
+// and a completed task is not reopened; either would be a new task.
 type TaskRunStatus string
 
 // Bounded TaskRunStatus set.
@@ -45,6 +48,39 @@ const (
 	// TaskAbandoned means the task was withdrawn without completion evidence.
 	TaskAbandoned TaskRunStatus = "ABANDONED"
 )
+
+// IsTerminal reports whether the task has reached a final scheduling state.
+func (s TaskRunStatus) IsTerminal() bool {
+	return s == TaskCompleted || s == TaskAbandoned
+}
+
+// CanTransitionTo reports whether moving a task from s to next is a permitted
+// transition.
+//
+// A task may cycle between READY, RUNNING and BLOCKED_DESIGN as attempts come
+// and go and as design questions block and unblock it. Reaching COMPLETED or
+// ABANDONED ends it: an explicitly withdrawn task must not be silently
+// re-admitted for execution, and a completed one must not be reopened.
+func (s TaskRunStatus) CanTransitionTo(next TaskRunStatus) bool {
+	if s == next {
+		return true
+	}
+	if s.IsTerminal() {
+		return false
+	}
+	switch s {
+	case TaskReady:
+		return next == TaskRunning || next == TaskBlockedDesign ||
+			next == TaskCompleted || next == TaskAbandoned
+	case TaskRunning:
+		return next == TaskReady || next == TaskBlockedDesign ||
+			next == TaskCompleted || next == TaskAbandoned
+	case TaskBlockedDesign:
+		return next == TaskReady || next == TaskRunning || next == TaskAbandoned
+	default:
+		return false
+	}
+}
 
 // WorkerAttemptStatus is the execution state of a single WorkerAttempt.
 //
@@ -187,7 +223,15 @@ func (s PublishStatus) CanTransitionTo(next PublishStatus) bool {
 		return next == PublishApplied || next == PublishObserved ||
 			next == PublishRejected || next == PublishUnknown
 	case PublishApplied:
-		return next == PublishObserved || next == PublishUnknown
+		// Deliberately not APPLIED -> UNKNOWN. APPLIED already records that
+		// the remote mutation was made, and UNKNOWN means "we cannot tell
+		// whether it was" — so the step would discard information, and since
+		// UNKNOWN -> REJECTED is permitted it would let a landed publication
+		// end up permanently recorded as "nothing was published". REJECTED is
+		// terminal and the idempotency key is unique, so that record could
+		// never be corrected. A reconciler that cannot confirm an applied
+		// publication leaves it APPLIED, which is the truthful state.
+		return next == PublishObserved
 	case PublishUnknown:
 		return next == PublishApplied || next == PublishObserved || next == PublishRejected
 	default:
