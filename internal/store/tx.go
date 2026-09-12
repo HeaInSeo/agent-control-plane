@@ -28,6 +28,9 @@ var (
 	// ErrNoSchedulerOwnership means this handle never acquired scheduler
 	// ownership, so it may not mutate execution state.
 	ErrNoSchedulerOwnership = errors.New("handle has not acquired scheduler ownership")
+	// ErrNestedTransaction means a transaction was started while another was
+	// already open on the same handle.
+	ErrNestedTransaction = errors.New("transaction is already open on this handle")
 )
 
 // Tx is a transactional view of the store.
@@ -107,6 +110,12 @@ func (db *DB) nowFunc() func() time.Time {
 //
 // The transaction is rolled back if fn returns an error or panics, and the
 // error from fn is returned unchanged so callers can match on domain errors.
+//
+// Transactions do not nest. The store holds a single connection, matching the
+// single-active-scheduler model, so an inner transaction would wait for the
+// connection the outer one is holding and never get it. Calling Write or Read
+// from inside either returns ErrNestedTransaction rather than deadlocking;
+// use the *Tx already in hand.
 func (db *DB) Write(ctx context.Context, fn func(*Tx) error) error {
 	if db.mode == ModeReadOnly {
 		return fmt.Errorf("%w: cannot start a write transaction", ErrReadOnly)
@@ -115,6 +124,8 @@ func (db *DB) Write(ctx context.Context, fn func(*Tx) error) error {
 }
 
 // Read runs fn inside a read-only transaction.
+//
+// Like Write, it does not nest: see Write for why.
 //
 // Read-only is enforced, not merely requested. The driver treats
 // sql.TxOptions.ReadOnly as a hint about which BEGIN to issue and applies no
@@ -131,6 +142,14 @@ func (db *DB) Read(ctx context.Context, fn func(*Tx) error) error {
 }
 
 func (db *DB) runTx(ctx context.Context, readOnly bool, fn func(*Tx) error) (err error) {
+	// Claim the handle before asking for the connection, so a nested call
+	// fails immediately instead of blocking on a connection that the outer
+	// transaction will not release until it returns.
+	if !db.inTx.CompareAndSwap(false, true) {
+		return fmt.Errorf("%w: use the transaction already in hand", ErrNestedTransaction)
+	}
+	defer db.inTx.Store(false)
+
 	sqlTx, err := db.sql.BeginTx(ctx, &sql.TxOptions{ReadOnly: readOnly})
 	if err != nil {
 		return fmt.Errorf("store: begin transaction: %w", err)

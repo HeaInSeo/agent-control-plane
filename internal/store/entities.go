@@ -29,6 +29,9 @@ func (t *Tx) ObserveRepositorySubject(ctx context.Context, subject domain.Reposi
 	if err := subject.Validate(); err != nil {
 		return domain.RepositorySubject{}, err
 	}
+	if err := t.RequireOwnership(ctx); err != nil {
+		return domain.RepositorySubject{}, err
+	}
 
 	existing, err := t.RepositorySubjectByNodeID(ctx, subject.GitHubNodeID)
 	switch {
@@ -63,24 +66,29 @@ func (t *Tx) ObserveRepositorySubject(ctx context.Context, subject domain.Reposi
 		); err != nil {
 			return domain.RepositorySubject{}, fmt.Errorf("rename repository subject: %w", err)
 		}
+		// The event is the alias history: without it the previous owner/name
+		// is unrecoverable from the database. It is therefore written
+		// unconditionally, and a failure to write it fails the rename —
+		// previously a missing scheduler epoch was swallowed here and the
+		// rename committed with no record of what it replaced. Ownership is
+		// required above, so an epoch always exists by this point.
 		epoch, err := t.CurrentEpoch(ctx)
-		if err == nil {
-			if _, err := t.AppendEvent(ctx, domain.Event{
-				SchedulerEpoch: epoch,
-				EventID:        ids.NewEventID(),
-				OccurredAt:     subject.ObservedAt,
-				EventType:      "repository_subject.renamed",
-				SubjectKind:    domain.SubjectRepositorySubject,
-				SubjectID:      string(existing.RepositorySubjectID),
-				Fields: map[string]any{
-					"github_node_id": subject.GitHubNodeID,
-					"previous_name":  existing.CurrentFullName,
-					"current_name":   subject.CurrentFullName,
-				},
-			}); err != nil {
-				return domain.RepositorySubject{}, err
-			}
-		} else if !errors.Is(err, ErrNoSchedulerEpoch) {
+		if err != nil {
+			return domain.RepositorySubject{}, err
+		}
+		if _, err := t.AppendEvent(ctx, domain.Event{
+			SchedulerEpoch: epoch,
+			EventID:        ids.NewEventID(),
+			OccurredAt:     subject.ObservedAt,
+			EventType:      "repository_subject.renamed",
+			SubjectKind:    domain.SubjectRepositorySubject,
+			SubjectID:      string(existing.RepositorySubjectID),
+			Fields: map[string]any{
+				"github_node_id": subject.GitHubNodeID,
+				"previous_name":  existing.CurrentFullName,
+				"current_name":   subject.CurrentFullName,
+			},
+		}); err != nil {
 			return domain.RepositorySubject{}, err
 		}
 		existing.CurrentFullName = subject.CurrentFullName

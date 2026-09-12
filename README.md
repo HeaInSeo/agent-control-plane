@@ -87,4 +87,8 @@ CGO_ENABLED=0 go test ./...
 ```
 
 Migrations are embedded and forward-only. A migration that has been applied is
-never edited: its checksum is recorded, and a mismatch fails the next open.
+never edited: its checksum is recorded, and a mismatch fails the next open —
+on every open path, including read-only inspection.
+
+Transactions do not nest: the store holds a single connection, so `Write` and
+`Read` refuse a nested call rather than deadlocking on it.

@@ -76,8 +76,9 @@ func (t *Tx) RecordPublishAttempt(ctx context.Context, p domain.PublishAttempt) 
 		string(p.RepositorySubjectID), string(p.BaseSHA), string(p.SourceCommitSHA),
 		p.TargetRef, p.IdempotencyKey, string(p.Status), formatTime(p.CreatedAt))
 	if err != nil {
-		if isUniqueViolation(err) {
-			return fmt.Errorf("%w: idempotency_key %s is already recorded: %w",
+		if isUniqueViolationOn(err, "publish_attempt.idempotency_key") {
+			return fmt.Errorf("%w: idempotency_key %s is already recorded; "+
+				"resolve it with PublishAttemptByIdempotencyKey: %w",
 				ErrDuplicatePublishIdentity, p.IdempotencyKey, err)
 		}
 		return fmt.Errorf("insert publish attempt: %w", err)

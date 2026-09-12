@@ -212,11 +212,14 @@ Defences in M0:
 
 - A missing database is an error unless creation is explicitly requested.
 - A non-SQLite file is rejected and left untouched.
-- A SQLite file without this control plane's `db_kind` marker is refused.
+- A SQLite file without this control plane's `db_kind` marker is refused, and
+  refused without being touched: every inspection happens before the first
+  write pragma, so a mistyped path cannot convert an unrelated service's
+  database to WAL on the way to rejecting it.
 - The integrity check runs on open and a failure is terminal.
 - A schema newer than the running build fails closed.
 - A tampered migration checksum, or a recorded migration this build does not
-  know, fails closed.
+  know, fails closed — on every open, not only when migrating.
 - Bootstrap writes the identity marker and the migration ledger in one
   transaction before any migration, so a crash mid-bootstrap leaves a database
   that is recognisably ours and safely retryable instead of one that fails as
@@ -254,8 +257,11 @@ value is itself a container has the whole value replaced rather than being
 descended into. Redaction happens inside the store, so a caller that passes a
 credential cannot get it into durable history.
 
-Short sensitive tokens are matched as whole words rather than substrings.
-`pat` occurs inside path, patch, compat, pattern and dispatch, and because
+Coverage includes auth, pass, pw, passphrase, deploy/signing/encryption keys,
+JWTs and one-time codes. Short sensitive tokens are matched as whole words
+rather than substrings.
+`pat` occurs inside path, patch, compat, pattern and dispatch; `auth` inside
+author, authored_at and authority; `pass` inside passing and bypass. Because
 redaction runs inside `AppendEvent` on an append-only table, a substring match
 there would permanently destroy ordinary operational data — the workspace path
 of every attempt, for one — from the history this control plane exists to

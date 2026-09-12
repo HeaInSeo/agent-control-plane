@@ -1,6 +1,11 @@
 package store
 
-import "context"
+import (
+	"context"
+	"fmt"
+
+	"github.com/HeaInSeo/agent-control-plane/internal/domain"
+)
 
 // BootstrapForTest runs only the bootstrap step — the database identity
 // marker and the migration ledger — without applying any migration.
@@ -43,4 +48,43 @@ func (t *Tx) QueryStringForTest(ctx context.Context, query string, args ...any) 
 	var out string
 	err := t.tx.QueryRowContext(ctx, query, args...).Scan(&out)
 	return out, err
+}
+
+// AppendEventAt inserts an event at an explicit sequence number.
+//
+// It exists only for tests, and only in the test build: it lets a test prove
+// the (epoch, seq) uniqueness constraint is real. It is deliberately not
+// production surface — a caller that could choose its own seq could punch a
+// permanent hole in an append-only replay stream, or pick MaxInt64 and wedge
+// the epoch, since the next allocation would overflow and fail the
+// seq >= 1 check. Normal callers use AppendEvent and let the store allocate.
+func (t *Tx) AppendEventAt(ctx context.Context, e domain.Event, seq int64) error {
+	if err := e.Validate(); err != nil {
+		return err
+	}
+	if err := t.RequireOwnership(ctx); err != nil {
+		return err
+	}
+	if err := t.RequireCurrentEpoch(ctx, e.SchedulerEpoch); err != nil {
+		return err
+	}
+	fields, err := domain.EncodeFields(e.Fields)
+	if err != nil {
+		return err
+	}
+	if _, err := t.exec(ctx,
+		`INSERT INTO event (scheduler_epoch, seq, event_id, occurred_at, event_type,
+		                    subject_kind, subject_id, task_id, attempt_id, fields)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		int64(e.SchedulerEpoch), seq, string(e.EventID), formatTime(e.OccurredAt),
+		e.EventType, string(e.SubjectKind), e.SubjectID,
+		taskIDArg(e.TaskID), attemptIDArg(e.AttemptID), fields,
+	); err != nil {
+		if isUniqueViolation(err) {
+			return fmt.Errorf("%w: event (epoch %d, seq %d) already exists: %w",
+				ErrDuplicateEventIdentity, int64(e.SchedulerEpoch), seq, err)
+		}
+		return fmt.Errorf("append event at seq %d: %w", seq, err)
+	}
+	return nil
 }

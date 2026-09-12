@@ -102,7 +102,14 @@ type DB struct {
 	// never did. Mutating execution state requires owning the current
 	// generation, so a handle from a retired generation is fenced out in both
 	// directions: it cannot act on old rows, and it cannot act on new ones.
-	ownerEpoch atomic.Int64
+	//
+	// It is a pointer because derived handles (WithClock, the activation
+	// handle) share one underlying *sql.DB and therefore one ownership.
+	ownerEpoch *atomic.Int64
+	// inTx guards against a nested transaction. The store holds a single
+	// connection, so an inner BeginTx would wait for the connection the outer
+	// transaction is holding and never get it. Shared for the same reason.
+	inTx *atomic.Bool
 	// assumeOwnership is set only on the internal handle the activation
 	// transaction runs under, since that is what establishes ownership.
 	assumeOwnership bool
@@ -165,9 +172,14 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	sqlDB.SetMaxOpenConns(1)
 	sqlDB.SetMaxIdleConns(1)
 
-	db := &DB{sql: sqlDB, mode: cfg.Mode, path: cfg.Path}
+	db := newHandle(sqlDB, cfg)
 
-	if err := db.configure(ctx, cfg); err != nil {
+	// Everything that inspects the file runs before anything that writes to
+	// it. Order matters here: PRAGMA journal_mode = WAL rewrites the database
+	// header and leaves -wal/-shm sidecars, so setting it before the identity
+	// check would convert an unrelated service's database on the way to
+	// refusing it — damaging exactly the file the check exists to protect.
+	if err := db.verifyConnection(ctx, cfg); err != nil {
 		_ = sqlDB.Close()
 		return nil, err
 	}
@@ -176,17 +188,54 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 			_ = sqlDB.Close()
 			return nil, err
 		}
-		// Fail closed on a database written by a newer build. Migrate and
-		// VerifySchema already refuse one, but neither is on the Open path: a
-		// read-only inspector, a backup job or an integrity checker would
-		// otherwise read — and a read-write handle would write — a database
-		// carrying invariants this build does not know about.
-		if err := db.rejectNewerSchema(ctx); err != nil {
+		if err := db.verifyAppliedSchema(ctx); err != nil {
 			_ = sqlDB.Close()
 			return nil, err
 		}
 	}
+	if err := db.enableWAL(ctx); err != nil {
+		_ = sqlDB.Close()
+		return nil, err
+	}
 	return db, nil
+}
+
+// newHandle builds a handle with its shared per-database state.
+func newHandle(sqlDB *sql.DB, cfg Config) *DB {
+	return &DB{
+		sql:        sqlDB,
+		mode:       cfg.Mode,
+		path:       cfg.Path,
+		ownerEpoch: new(atomic.Int64),
+		inTx:       new(atomic.Bool),
+	}
+}
+
+// verifyAppliedSchema refuses a database whose recorded migration history
+// does not match this build's.
+//
+// This is the whole check, not only the newer-than-supported case: a tampered
+// checksum or a migration name this build has never heard of means the
+// applied schema and this source tree have diverged, and reading or writing
+// such a database is exactly as unsafe. Migrate and VerifySchema run the same
+// verification, but neither is on the Open path, so a read-only inspector or
+// a backup job would otherwise proceed happily.
+func (db *DB) verifyAppliedSchema(ctx context.Context) error {
+	applied, err := db.AppliedMigrations(ctx)
+	if err != nil {
+		return err
+	}
+	if len(applied) == 0 {
+		return nil
+	}
+	known, err := Migrations()
+	if err != nil {
+		return err
+	}
+	// A partially migrated database is legitimate: it is one this process may
+	// be about to migrate forward. verifyHistory allows a proper prefix and
+	// rejects divergence.
+	return verifyHistory(applied, known)
 }
 
 // rejectNewerSchema refuses a database migrated beyond what this build knows.
@@ -258,21 +307,10 @@ func dsn(cfg Config) string {
 	return (&url.URL{Scheme: "file", Path: cfg.Path}).String() + "?" + strings.Join(params, "&")
 }
 
-// configure sets the database-level journal mode, verifies that the
-// connection pragmas the DSN asked for actually took effect, and checks the
-// file is usable.
-func (db *DB) configure(ctx context.Context, cfg Config) error {
-	if db.mode == ModeReadWrite {
-		// journal_mode is stored in the database file, so it is set once here
-		// rather than per connection.
-		var journal string
-		if err := db.sql.QueryRowContext(ctx, "PRAGMA journal_mode = WAL").Scan(&journal); err != nil {
-			return fmt.Errorf("store: enable WAL: %w", err)
-		}
-		if journal != "wal" {
-			return fmt.Errorf("store: journal_mode is %q, want wal", journal)
-		}
-	}
+// verifyConnection runs the read-only half of open-time validation: the
+// connection pragmas the DSN asked for, and the integrity check. Nothing here
+// writes to the database.
+func (db *DB) verifyConnection(ctx context.Context, cfg Config) error {
 	if err := db.VerifyConnectionPragmas(ctx); err != nil {
 		return err
 	}
@@ -280,6 +318,25 @@ func (db *DB) configure(ctx context.Context, cfg Config) error {
 		if err := db.IntegrityCheck(ctx); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// enableWAL sets the journal mode, which is a property of the database file
+// rather than of the connection, so it is set once rather than per connection.
+//
+// This is the first write Open performs, and it only happens after the file
+// has been established as ours.
+func (db *DB) enableWAL(ctx context.Context) error {
+	if db.mode != ModeReadWrite {
+		return nil
+	}
+	var journal string
+	if err := db.sql.QueryRowContext(ctx, "PRAGMA journal_mode = WAL").Scan(&journal); err != nil {
+		return fmt.Errorf("store: enable WAL: %w", err)
+	}
+	if journal != "wal" {
+		return fmt.Errorf("store: journal_mode is %q, want wal", journal)
 	}
 	return nil
 }
@@ -433,21 +490,22 @@ func inspectFile(path string) (fileState, error) {
 	return fileDatabase, nil
 }
 
-// shallowCopy returns a handle sharing the same connection and ownership.
+// shallowCopy returns a handle sharing the same connection, ownership and
+// transaction state.
 //
-// atomic.Int64 must not be copied by value, so the ownership generation is
-// carried across explicitly. The copy shares the underlying *sql.DB, which is
-// the point: it is the same database handle with one field changed.
+// Sharing rather than copying is the point: it is the same database handle
+// with one field changed, so ownership acquired through one is visible through
+// the other, and a transaction open on one is seen by the other.
 func (db *DB) shallowCopy() *DB {
-	clone := &DB{
+	return &DB{
 		sql:             db.sql,
 		mode:            db.mode,
 		path:            db.path,
 		clock:           db.clock,
+		ownerEpoch:      db.ownerEpoch,
+		inTx:            db.inTx,
 		assumeOwnership: db.assumeOwnership,
 	}
-	clone.ownerEpoch.Store(db.ownerEpoch.Load())
-	return clone
 }
 
 // Mode reports the handle's access mode.

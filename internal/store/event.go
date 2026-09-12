@@ -135,37 +135,6 @@ func (t *Tx) EventsInEpoch(ctx context.Context, epoch domain.Epoch) ([]domain.Ev
 	return out, nil
 }
 
-// AppendEventAt inserts an event at an explicit sequence number. It exists so
-// that tests can prove the (epoch, seq) uniqueness constraint is real; normal
-// callers use AppendEvent and let the store allocate.
-func (t *Tx) AppendEventAt(ctx context.Context, e domain.Event, seq int64) error {
-	if err := e.Validate(); err != nil {
-		return err
-	}
-	if err := t.RequireCurrentEpoch(ctx, e.SchedulerEpoch); err != nil {
-		return err
-	}
-	fields, err := domain.EncodeFields(e.Fields)
-	if err != nil {
-		return err
-	}
-	if _, err := t.exec(ctx,
-		`INSERT INTO event (scheduler_epoch, seq, event_id, occurred_at, event_type,
-		                    subject_kind, subject_id, task_id, attempt_id, fields)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		int64(e.SchedulerEpoch), seq, string(e.EventID), formatTime(e.OccurredAt),
-		e.EventType, string(e.SubjectKind), e.SubjectID,
-		taskIDArg(e.TaskID), attemptIDArg(e.AttemptID), fields,
-	); err != nil {
-		if isUniqueViolation(err) {
-			return fmt.Errorf("%w: event (epoch %d, seq %d) already exists: %w",
-				ErrDuplicateEventIdentity, int64(e.SchedulerEpoch), seq, err)
-		}
-		return fmt.Errorf("append event at seq %d: %w", seq, err)
-	}
-	return nil
-}
-
 // ErrDuplicateEventIdentity is returned when (scheduler_epoch, seq) collides.
 var ErrDuplicateEventIdentity = errors.New("duplicate event identity")
 
@@ -180,4 +149,23 @@ func isUniqueViolation(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "unique constraint failed") ||
 		strings.Contains(msg, "constraint failed: unique")
+}
+
+// isUniqueViolationOn reports whether err is a uniqueness failure naming all
+// of the given columns.
+//
+// Matching the column matters: without it any uniqueness failure — a reused
+// primary key, say — would be reported as whichever constraint the caller
+// happened to guess, sending an operator after a problem that does not exist.
+func isUniqueViolationOn(err error, columns ...string) bool {
+	if !isUniqueViolation(err) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, column := range columns {
+		if !strings.Contains(msg, strings.ToLower(column)) {
+			return false
+		}
+	}
+	return true
 }

@@ -238,6 +238,16 @@ func CheckPublishPreconditions(p PublishAttempt, live PublishPreconditions) erro
 	if err := p.Validate(); err != nil {
 		return err
 	}
+	// A publication whose lifecycle has already been decided must not be
+	// performed again. This matters most on the recovery path: a publisher
+	// restarting after a crash resolves the existing intent by its
+	// idempotency key and re-runs this gate, and an APPLIED or OBSERVED
+	// intent means the remote mutation already happened. Resolving an UNKNOWN
+	// outcome is reconciliation, not re-publication.
+	if p.Status != state.PublishPending {
+		return fmt.Errorf("%w: publication status is %q, so it is not pending",
+			ErrPublishBindingInvalid, string(p.Status))
+	}
 	if live.CurrentSchedulerEpoch != p.SchedulerEpoch {
 		return fmt.Errorf("%w: publish bound to scheduler epoch %d, current epoch is %d",
 			ErrPublishBindingInvalid, int64(p.SchedulerEpoch), int64(live.CurrentSchedulerEpoch))

@@ -115,9 +115,11 @@ func (e Event) Validate() error {
 // with ordinary field names. Short abbreviations belong in
 // sensitiveTokens instead.
 var sensitiveFragments = []string{
-	"token", "secret", "password", "passwd", "credential", "authorization",
-	"bearer", "cookie", "private_key", "privatekey", "api_key", "apikey",
-	"access_key", "session_key", "ssh_key", "signature",
+	"token", "secret", "password", "passwd", "passphrase", "credential",
+	"authorization", "bearer", "cookie", "private_key", "privatekey",
+	"api_key", "apikey", "access_key", "secret_key", "session_key",
+	"ssh_key", "sshkey", "deploy_key", "signing_key", "encryption_key",
+	"signature",
 }
 
 // sensitiveTokens mark a field name as sensitive only when they appear as a
@@ -129,7 +131,17 @@ var sensitiveFragments = []string{
 // would permanently destroy ordinary operational data — the workspace path of
 // every attempt, for one — from the history this control plane exists to
 // preserve.
-var sensitiveTokens = []string{"pat", "pats"}
+var sensitiveTokens = []string{
+	"pat", "pats",
+	// "auth" cannot be a substring: it occurs in author, authored_at,
+	// authority. As a whole word it still catches auth and basic_auth.
+	"auth",
+	// "pass" and "pw" likewise: passing, passenger, password (already a
+	// fragment) and pwd-adjacent names must survive.
+	"pass", "pw", "pwd",
+	"cred", "creds",
+	"jwt", "otp", "totp",
+}
 
 // RedactFields returns a copy of in with sensitive values replaced.
 //

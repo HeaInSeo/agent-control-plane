@@ -22,6 +22,19 @@ var ErrInvalidTaskRun = errors.New("invalid task run mutation")
 // permitted transition.
 var ErrForbiddenTaskTransition = errors.New("forbidden task run status transition")
 
+// ErrModifyingSlotBusy is returned when a repository subject already has a
+// live modifying attempt (CC9).
+//
+// This is an ordinary scheduling outcome — "come back later", not a fault —
+// so it has its own sentinel. Leaving it as a raw unique-constraint error
+// would make the single most common legitimate refusal indistinguishable from
+// a broken database.
+var ErrModifyingSlotBusy = errors.New("repository already has a live modifying attempt")
+
+// ErrWorkspaceConflict is returned when a workspace would collide with an
+// existing one, on its attempt or on its directory.
+var ErrWorkspaceConflict = errors.New("workspace conflicts with an existing workspace")
+
 // ---------------------------------------------------------------------------
 // TaskRun
 // ---------------------------------------------------------------------------
@@ -377,6 +390,14 @@ func (t *Tx) CreateWorkerAttempt(ctx context.Context, a domain.WorkerAttempt) er
 		string(a.Status), formatTimePtr(a.LeaseExpiresAt), formatTimePtr(a.LastCheckpointAt),
 		formatTime(a.CreatedAt), formatTime(a.UpdatedAt),
 	); err != nil {
+		if isUniqueViolationOn(err, "worker_attempt.repository_subject_id") {
+			return fmt.Errorf("%w: repository subject %s (lane-agnostic): %w",
+				ErrModifyingSlotBusy, string(a.RepositorySubjectID), err)
+		}
+		if isUniqueViolationOn(err, "worker_attempt.task_id", "worker_attempt.fence_epoch") {
+			return fmt.Errorf("%w: fence epoch %d already issued for task %s: %w",
+				ErrInvalidTaskRun, int64(a.FenceEpoch), string(a.TaskID), err)
+		}
 		return fmt.Errorf("insert worker attempt: %w", err)
 	}
 	return nil
@@ -489,6 +510,14 @@ func (t *Tx) CreateWorkspace(ctx context.Context, w domain.Workspace) error {
 		string(w.WorkspaceID), string(w.AttemptID), string(w.TaskID), string(w.RepositorySubjectID),
 		string(w.BaseSHA), string(w.IsolationKind), w.RootPath, formatTime(w.CreatedAt),
 	); err != nil {
+		if isUniqueViolationOn(err, "workspace.root_path") {
+			return fmt.Errorf("%w: directory %s is already a workspace: %w",
+				ErrWorkspaceConflict, w.RootPath, err)
+		}
+		if isUniqueViolationOn(err, "workspace.attempt_id") {
+			return fmt.Errorf("%w: attempt %s already owns a workspace: %w",
+				ErrWorkspaceConflict, string(w.AttemptID), err)
+		}
 		return fmt.Errorf("insert workspace: %w", err)
 	}
 	return nil

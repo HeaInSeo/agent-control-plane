@@ -104,6 +104,12 @@ publication. A packet can go stale, be superseded or expire while an attempt is
 mid-run, and a packet that means "execution must stop" must not be the basis
 for starting more of it.
 
+The gate also refuses a publication whose lifecycle has already been decided.
+That matters most on the recovery path: a publisher restarting after a crash
+resolves the existing intent by its idempotency key and re-runs the gate, and
+an `APPLIED` or `OBSERVED` intent means the remote mutation already happened.
+Resolving an `UNKNOWN` outcome is reconciliation, not re-publication.
+
 A publication's identity is also resolvable, not only unique:
 `PublishAttemptByIdempotencyKey` and `PublishAttemptsForAttempt` let a
 publisher restarting after a crash reach the intent that already exists and
@@ -327,6 +333,11 @@ CREATE UNIQUE INDEX ux_modifying_slot_per_repository
 The exclusion key is the repository subject, not the lane. No lane can obtain a
 private modifying lock, because there is no lane column in the index.
 
+Contention on that slot is an ordinary scheduling outcome rather than a fault,
+so it surfaces as `ErrModifyingSlotBusy` — a caller needs to tell "come back
+later" apart from a broken database without matching on driver strings.
+Workspace collisions are typed the same way, as `ErrWorkspaceConflict`.
+
 ### CC10 — stable identifiers and event identity
 
 One distinct Go type per identifier kind, each with a kind prefix carried in
@@ -340,16 +351,31 @@ transaction.
 WAL, a single connection matching the single-active-scheduler model, and
 `BEGIN IMMEDIATE` via `_txlock=immediate`.
 
-Open also refuses a database migrated beyond what the running build knows.
-`Migrate` and `VerifySchema` already do, but neither is on the Open path: a
-read-only inspector, a backup job or an integrity checker would otherwise read
-— and a read-write handle would write — a database carrying invariants this
-build has never heard of.
+Open also refuses a database whose recorded migration history does not match
+this build's — a newer version, a tampered checksum, or a migration name this
+build has never heard of. `Migrate` and `VerifySchema` run the same check, but
+neither is on the Open path: a read-only inspector, a backup job or an
+integrity checker would otherwise read, and a read-write handle would write, a
+database carrying invariants this build does not know. A partially migrated
+database still opens, since that is one a process may be about to migrate
+forward.
+
+Everything that inspects the file runs before anything that writes to it.
+`PRAGMA journal_mode = WAL` rewrites the database header and leaves `-wal` and
+`-shm` sidecars, so setting it before the identity check would convert an
+unrelated service's database on the way to refusing it — damaging the very
+file the check exists to protect.
 
 `Config.Path` is resolved to an absolute path at open time. The DSN is a
 `file:` URI, and a relative path inside one is read as a URI authority rather
 than a path, so a relative path would otherwise fail with an opaque driver
 error after the stat and directory creation had already succeeded.
+
+Transactions do not nest. The store holds a single connection, matching the
+single-active-scheduler model, so an inner transaction would wait for the
+connection the outer one holds and never get it. `Write` and `Read` claim the
+handle before asking for a connection, so a nested call returns
+`ErrNestedTransaction` immediately instead of deadlocking.
 
 `Read` runs a genuinely read-only transaction: the driver treats
 `sql.TxOptions.ReadOnly` as a hint about which `BEGIN` to issue and enforces

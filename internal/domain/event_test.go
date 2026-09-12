@@ -191,3 +191,38 @@ func TestEncodeFieldsHandlesHostileShapes(t *testing.T) {
 		}
 	})
 }
+
+// Finding 6: redaction missed several obvious credential key names, and
+// event history cannot be corrected after the fact.
+func TestRedactionCoversCommonCredentialNames(t *testing.T) {
+	mustRedact := []string{
+		"auth", "basic_auth", "Authorization", "authToken",
+		"pass", "pw", "pwd", "password", "passwd", "passphrase",
+		"ssh_passphrase", "deploy_key", "signing_key", "encryption_key",
+		"secret_key", "client_secret", "refresh_token", "id_token",
+		"cred", "creds", "credentials", "jwt", "otp", "totp",
+		"session_cookie", "bearer_value", "api_key", "access_key",
+	}
+	for _, key := range mustRedact {
+		out := domain.RedactFields(map[string]any{key: "fake-not-a-real-secret"})
+		if out[key] != domain.Redacted {
+			t.Fatalf("sensitive field %q survived as %v", key, out[key])
+		}
+	}
+
+	// Widening must not start destroying ordinary operational data: these are
+	// the false positives the substring approach would have produced.
+	mustSurvive := []string{
+		"author", "authored_at", "authority", "co_author",
+		"passing", "passenger", "bypass_count", "compat",
+		"root_path", "patch", "pattern", "dispatch",
+		"keyword", "monkey", "key_count", "pwned_check_url",
+		"credit", "accredited", "otpsomething",
+	}
+	for _, key := range mustSurvive {
+		out := domain.RedactFields(map[string]any{key: "keep-me"})
+		if out[key] != "keep-me" {
+			t.Fatalf("ordinary field %q was destroyed", key)
+		}
+	}
+}

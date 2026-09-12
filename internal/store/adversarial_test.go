@@ -883,6 +883,11 @@ func TestEventFieldsAreRedactedOnAppend(t *testing.T) {
 func TestAmbiguousRepositoryAliasFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	db := newDB(t)
+	// Observing a repository is a scheduler-owned write, so the handle needs
+	// ownership before it can record anything.
+	if _, err := db.ActivateScheduler(ctx, ids.NewSchedulerOwnerID(), "alias test"); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
 
 	// Two distinct repositories transiently observed under the same alias,
 	// which is what a rename looks like before reconciliation catches up.
