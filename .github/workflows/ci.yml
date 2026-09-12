@@ -1,0 +1,63 @@
+name: ci
+
+# Note: this workflow existing is not the same thing as GitHub enforcing it.
+# As of M0 no branch protection, ruleset or required status check is configured
+# on this repository, so a red run here does not by itself block a merge. The
+# repository guardrail baseline is reported with the M0 handoff.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go mod verify
+        run: go mod verify
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # The SQLite driver is pure Go: the whole tree must build and pass with
+      # no C toolchain at all.
+      - name: go build (CGO_ENABLED=0)
+        run: go build ./...
+        env:
+          CGO_ENABLED: "0"
+
+      - name: go test (CGO_ENABLED=0)
+        run: go test -count=1 ./...
+        env:
+          CGO_ENABLED: "0"
+
+      # -race needs cgo, so it runs as a separate pass rather than forcing the
+      # rest of the build to depend on a C toolchain.
+      - name: go test -race
+        run: go test -race -count=1 ./...
+        env:
+          CGO_ENABLED: "1"
