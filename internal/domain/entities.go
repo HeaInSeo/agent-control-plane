@@ -3,6 +3,7 @@ package domain
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -227,13 +228,25 @@ func (k IsolationKind) Validate() error {
 	}
 }
 
-// validateWorkspacePath requires an absolute, already-canonical path.
+// validateWorkspacePath requires an absolute, already-canonical path, and
+// resolves symlinks where the path exists.
 //
 // The schema's UNIQUE(root_path) is the filesystem half of the isolation
-// invariant, but uniqueness of a string is not uniqueness of a directory:
-// "/a/ws", "/a/ws/", "/a/./ws", "/a/b/../ws" and a relative "ws" are five
-// distinct strings naming at most one directory. Requiring a canonical
-// absolute form is what makes the constraint mean what CC3 says it means.
+// invariant, but uniqueness of a string is weaker than uniqueness of a
+// directory. Two problems, with different strengths of answer:
+//
+// Lexical aliases — "/a/ws", "/a/ws/", "/a/./ws", "/a/b/../ws" and a relative
+// "ws" — are five strings naming at most one directory. Requiring an absolute
+// Clean-stable form rules these out completely.
+//
+// Symlinks are only partly ruled out. If /srv/ws-a links to /srv/ws-b, then
+// /srv/ws-a/t1 and /srv/ws-b/t1 are both canonical strings naming one
+// physical tree, and two attempts pointed at them would share a working
+// directory — the sharing CC3 forbids. Where the path already exists it is
+// resolved and rejected if it is not its own resolution. Where it does not
+// exist yet there is nothing to resolve, so the guarantee is lexical only,
+// and the workspace allocator that actually creates the directory must
+// re-check after creating it.
 func validateWorkspacePath(path string) error {
 	if path == "" {
 		return fmt.Errorf("%w: root_path is empty", ErrInvalidEntity)
@@ -243,6 +256,19 @@ func validateWorkspacePath(path string) error {
 	}
 	if cleaned := filepath.Clean(path); cleaned != path {
 		return fmt.Errorf("%w: root_path %q is not canonical (want %q)", ErrInvalidEntity, path, cleaned)
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if errors.Is(err, os.ErrNotExist) {
+		// The directory has not been created yet, which is the normal case
+		// when a workspace is recorded before it is materialised.
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("%w: root_path %q could not be resolved: %w", ErrInvalidEntity, path, err)
+	}
+	if resolved != path {
+		return fmt.Errorf("%w: root_path %q resolves to %q; use the resolved path so that "+
+			"two workspaces cannot name one directory", ErrInvalidEntity, path, resolved)
 	}
 	return nil
 }

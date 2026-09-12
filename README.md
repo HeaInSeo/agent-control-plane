@@ -90,5 +90,6 @@ Migrations are embedded and forward-only. A migration that has been applied is
 never edited: its checksum is recorded, and a mismatch fails the next open —
 on every open path, including read-only inspection.
 
-Transactions do not nest: the store holds a single connection, so `Write` and
-`Read` refuse a nested call rather than deadlocking on it.
+Concurrent callers are safe — the store holds a single connection, so
+transactions serialise. Transactions do not nest, though: `Write` and `Read`
+refuse a nested call on the same goroutine rather than deadlocking on it.

@@ -225,4 +225,57 @@ func TestRedactionCoversCommonCredentialNames(t *testing.T) {
 			t.Fatalf("ordinary field %q was destroyed", key)
 		}
 	}
+
+	// The documented trade-off: a standalone credential word is redacted
+	// wherever it appears, so a name built around one is redacted too. None
+	// of these is part of the event vocabulary this control plane writes.
+	for _, key := range []string{"pass-through-count", "auth-mode", "pw-policy"} {
+		out := domain.RedactFields(map[string]any{key: "value"})
+		if out[key] != domain.Redacted {
+			t.Fatalf("expected %q to be redacted by the standalone-word rule, got %v", key, out[key])
+		}
+	}
+}
+
+// Finding 6.1: multi-word credential names were matched only against the raw
+// key, so the hyphenated spellings — the ones that actually appear in HTTP
+// headers and config files — bypassed redaction entirely.
+func TestRedactionIsSeparatorInsensitive(t *testing.T) {
+	mustRedact := []string{
+		"x-api-key", "api-key", "API-KEY", "Api-Key",
+		"ssh-key", "private-key", "deploy-key", "access-key",
+		"signing-key", "session-key", "encryption-key", "secret-key",
+		"x-auth-token", "github-token", "refresh-token",
+		"api.key", "api key", "api_key", "apiKey", "APIKey",
+		"x_api_key", "private.key",
+	}
+	for _, key := range mustRedact {
+		out := domain.RedactFields(map[string]any{key: "fake-not-a-real-secret"})
+		if out[key] != domain.Redacted {
+			t.Fatalf("sensitive field %q survived as %v", key, out[key])
+		}
+	}
+
+	// Separator normalisation must not create new false positives.
+	mustSurvive := []string{
+		"key-count", "monkey-bars", "keyboard-layout", "turnkey",
+		"author-name", "patch-set", "root-path",
+		"public-key-algorithm-name-length",
+	}
+	for _, key := range mustSurvive {
+		out := domain.RedactFields(map[string]any{key: "keep-me"})
+		if out[key] != "keep-me" {
+			t.Fatalf("ordinary field %q was destroyed", key)
+		}
+	}
+
+	// The documented trade-off: a standalone credential word is redacted
+	// wherever it appears, so a name built around one is redacted too. None
+	// of these is part of the event vocabulary this control plane writes.
+	for _, key := range []string{"pass-through-count", "auth-mode", "pw-policy"} {
+		out := domain.RedactFields(map[string]any{key: "value"})
+		if out[key] != domain.Redacted {
+			t.Fatalf("expected %q to be redacted by the standalone-word rule, got %v", key, out[key])
+		}
+	}
 }

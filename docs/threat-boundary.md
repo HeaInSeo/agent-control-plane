@@ -258,7 +258,11 @@ descended into. Redaction happens inside the store, so a caller that passes a
 credential cannot get it into durable history.
 
 Coverage includes auth, pass, pw, passphrase, deploy/signing/encryption keys,
-JWTs and one-time codes. Short sensitive tokens are matched as whole words
+JWTs and one-time codes, in every spelling: multi-word names are matched
+against the separator-normalised form as well as the raw one, so `api_key`,
+`apiKey`, `api-key` and the canonical header form `x-api-key` are all covered.
+Matching only the raw string let the hyphenated spellings — the ones that
+actually appear in HTTP headers and config files — through. Short sensitive tokens are matched as whole words
 rather than substrings.
 `pat` occurs inside path, patch, compat, pattern and dispatch; `auth` inside
 author, authored_at and authority; `pass` inside passing and bypass. Because
@@ -267,6 +271,12 @@ there would permanently destroy ordinary operational data — the workspace path
 of every attempt, for one — from the history this control plane exists to
 preserve. Recursion is depth-bounded, and a self-referential value is a clean
 error rather than a crash.
+
+A standalone credential word is treated as sensitive wherever it appears, so
+a name built around one — `auth-mode`, `pass-through-count` — is redacted too.
+That is deliberate: none of those words is part of the event vocabulary this
+control plane writes, and for a name that reads as a bare credential word the
+safe reading is that it holds one.
 
 This is defence in depth, not a licence to pass secrets: key-name matching
 cannot catch a credential stored under an innocuous name, one embedded in a
@@ -278,6 +288,7 @@ no key to match on.
 | Gap | Required before |
 | --- | --- |
 | A completed task still holds its repository's modifying slot — escalated, see below | resolution before M1 admission |
+| Workspace symlink resolution for a path that does not exist yet | the workspace allocator (M2) |
 | OS-level worker isolation and credential fence | first real worker (M2) |
 | Worker push-isolation test | first real worker (M2) |
 | Publisher with exact-SHA enforcement | first remote mutation (M3) |

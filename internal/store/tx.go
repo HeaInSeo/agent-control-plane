@@ -1,10 +1,13 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/HeaInSeo/agent-control-plane/internal/domain"
@@ -106,16 +109,45 @@ func (db *DB) nowFunc() func() time.Time {
 	return func() time.Time { return time.Now().UTC() }
 }
 
+// goroutineID returns the current goroutine's id, or 0 if it cannot be read.
+//
+// Go does not expose this, and needing it is a smell — but the alternative is
+// worse. The store has a single connection, so a nested transaction can only
+// ever deadlock, while a concurrent one merely has to wait. Telling the two
+// apart requires knowing whether the caller is the goroutine already holding
+// the lock, and there is no way to ask that without the id: a plain flag
+// rejects legitimate concurrency, and a plain mutex hangs on nesting.
+//
+// A failure to parse degrades safely: id 0 never matches an owner, so the
+// call waits like any other concurrent caller.
+func goroutineID() uint64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	// The first line is "goroutine <id> [<state>]:".
+	fields := bytes.Fields(buf[:n])
+	if len(fields) < 2 {
+		return 0
+	}
+	id, err := strconv.ParseUint(string(fields[1]), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return id
+}
+
 // Write runs fn inside a single write transaction.
 //
 // The transaction is rolled back if fn returns an error or panics, and the
 // error from fn is returned unchanged so callers can match on domain errors.
 //
-// Transactions do not nest. The store holds a single connection, matching the
-// single-active-scheduler model, so an inner transaction would wait for the
-// connection the outer one is holding and never get it. Calling Write or Read
-// from inside either returns ErrNestedTransaction rather than deadlocking;
-// use the *Tx already in hand.
+// Concurrent callers are safe: the store holds a single connection, matching
+// the single-active-scheduler model, so transactions serialise and a second
+// goroutine waits its turn.
+//
+// Transactions do not nest, though. An inner transaction on the same
+// goroutine would wait for the connection the outer one holds and never get
+// it, so Write and Read called from inside either return
+// ErrNestedTransaction rather than deadlocking; use the *Tx already in hand.
 func (db *DB) Write(ctx context.Context, fn func(*Tx) error) error {
 	if db.mode == ModeReadOnly {
 		return fmt.Errorf("%w: cannot start a write transaction", ErrReadOnly)
@@ -142,13 +174,20 @@ func (db *DB) Read(ctx context.Context, fn func(*Tx) error) error {
 }
 
 func (db *DB) runTx(ctx context.Context, readOnly bool, fn func(*Tx) error) (err error) {
-	// Claim the handle before asking for the connection, so a nested call
-	// fails immediately instead of blocking on a connection that the outer
-	// transaction will not release until it returns.
-	if !db.inTx.CompareAndSwap(false, true) {
+	// Concurrency and nesting need opposite answers, so they are told apart
+	// before taking the lock. A second goroutine should wait its turn — the
+	// store has one connection, so transactions serialise. The goroutine that
+	// already holds the lock must not wait, because nothing will release it.
+	self := goroutineID()
+	if self != 0 && db.txOwner.Load() == self {
 		return fmt.Errorf("%w: use the transaction already in hand", ErrNestedTransaction)
 	}
-	defer db.inTx.Store(false)
+	db.txMu.Lock()
+	db.txOwner.Store(self)
+	defer func() {
+		db.txOwner.Store(0)
+		db.txMu.Unlock()
+	}()
 
 	sqlTx, err := db.sql.BeginTx(ctx, &sql.TxOptions{ReadOnly: readOnly})
 	if err != nil {

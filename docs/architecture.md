@@ -110,6 +110,12 @@ resolves the existing intent by its idempotency key and re-runs the gate, and
 an `APPLIED` or `OBSERVED` intent means the remote mutation already happened.
 Resolving an `UNKNOWN` outcome is reconciliation, not re-publication.
 
+Recording a publication applies the same liveness fence as completion: a
+terminal attempt or a released workspace cannot mint one. Publication rows are
+undeletable and immutable except for status, so an intent minted by a
+fenced-out attempt would sit in the pending queue for ever, resolvable only to
+`REJECTED`.
+
 A publication's identity is also resolvable, not only unique:
 `PublishAttemptByIdempotencyKey` and `PublishAttemptsForAttempt` let a
 publisher restarting after a crash reach the intent that already exists and
@@ -142,6 +148,13 @@ immutable owner, so a workspace cannot be shared or rebound.
 not uniqueness of a directory: `/a/ws`, `/a/ws/`, `/a/./ws`, `/a/b/../ws` and a
 relative `ws` are five distinct strings naming at most one directory, so
 without canonicalisation the constraint would not mean what it says.
+
+Symlinks are only partly covered, and the distinction is worth stating plainly
+rather than claiming more than holds. Where the path already exists it is
+resolved and rejected if it is not its own resolution. Where it does not exist
+yet — the normal case, since M0 records a workspace without creating it —
+there is nothing to resolve, so the guarantee is lexical, and the allocator
+that materialises the directory must re-check afterwards.
 
 ### CC4 — SchedulerEpoch
 
@@ -371,11 +384,17 @@ file the check exists to protect.
 than a path, so a relative path would otherwise fail with an opaque driver
 error after the stat and directory creation had already succeeded.
 
-Transactions do not nest. The store holds a single connection, matching the
-single-active-scheduler model, so an inner transaction would wait for the
-connection the outer one holds and never get it. `Write` and `Read` claim the
-handle before asking for a connection, so a nested call returns
-`ErrNestedTransaction` immediately instead of deadlocking.
+Concurrent callers are safe. The store holds a single connection, matching the
+single-active-scheduler model, so transactions serialise on a mutex held for
+the duration of each one and a second goroutine simply waits its turn.
+
+Transactions do not nest, though: an inner transaction on the same goroutine
+would wait for the connection the outer one holds and never get it. The two
+cases need opposite answers — one should wait, the other must not — so they
+are told apart by which goroutine holds the lock, and a nested call returns
+`ErrNestedTransaction` immediately instead of deadlocking. A per-handle flag
+would have been simpler and wrong: it rejects legitimate concurrency as if it
+were nesting.
 
 `Read` runs a genuinely read-only transaction: the driver treats
 `sql.TxOptions.ReadOnly` as a hint about which `BEGIN` to issue and enforces

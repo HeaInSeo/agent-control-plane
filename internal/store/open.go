@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -106,10 +107,15 @@ type DB struct {
 	// It is a pointer because derived handles (WithClock, the activation
 	// handle) share one underlying *sql.DB and therefore one ownership.
 	ownerEpoch *atomic.Int64
-	// inTx guards against a nested transaction. The store holds a single
-	// connection, so an inner BeginTx would wait for the connection the outer
-	// transaction is holding and never get it. Shared for the same reason.
-	inTx *atomic.Bool
+	// txMu serialises transactions. The store holds a single connection to
+	// match the single-active-scheduler model, so concurrent callers have to
+	// take turns; holding a real mutex across the transaction makes them
+	// queue instead of contending for a connection nobody will release.
+	txMu *sync.Mutex
+	// txOwner is the goroutine currently inside a transaction, or 0. It is
+	// what lets a nested call be told apart from a concurrent one: waiting
+	// would deadlock only for the goroutine that already holds the lock.
+	txOwner *atomic.Uint64
 	// assumeOwnership is set only on the internal handle the activation
 	// transaction runs under, since that is what establishes ownership.
 	assumeOwnership bool
@@ -207,7 +213,8 @@ func newHandle(sqlDB *sql.DB, cfg Config) *DB {
 		mode:       cfg.Mode,
 		path:       cfg.Path,
 		ownerEpoch: new(atomic.Int64),
-		inTx:       new(atomic.Bool),
+		txMu:       new(sync.Mutex),
+		txOwner:    new(atomic.Uint64),
 	}
 }
 
@@ -236,33 +243,6 @@ func (db *DB) verifyAppliedSchema(ctx context.Context) error {
 	// be about to migrate forward. verifyHistory allows a proper prefix and
 	// rejects divergence.
 	return verifyHistory(applied, known)
-}
-
-// rejectNewerSchema refuses a database migrated beyond what this build knows.
-//
-// Only the "newer than supported" case is checked here. Full history
-// verification — contiguity, names, checksums — belongs to Migrate and
-// VerifySchema, which callers that intend to migrate or audit will run; this
-// is the check every caller needs, whatever it came to do.
-func (db *DB) rejectNewerSchema(ctx context.Context) error {
-	applied, err := db.AppliedMigrations(ctx)
-	if err != nil {
-		return err
-	}
-	if len(applied) == 0 {
-		return nil
-	}
-	known, err := Migrations()
-	if err != nil {
-		return err
-	}
-	highestApplied := applied[len(applied)-1].Version
-	highestKnown := known[len(known)-1].Version
-	if highestApplied > highestKnown {
-		return fmt.Errorf("%w: %s is at version %d, this build knows up to %d",
-			ErrSchemaVersionUnsupported, db.path, highestApplied, highestKnown)
-	}
-	return nil
 }
 
 // dsn builds the driver connection string.
@@ -503,7 +483,8 @@ func (db *DB) shallowCopy() *DB {
 		path:            db.path,
 		clock:           db.clock,
 		ownerEpoch:      db.ownerEpoch,
-		inTx:            db.inTx,
+		txMu:            db.txMu,
+		txOwner:         db.txOwner,
 		assumeOwnership: db.assumeOwnership,
 	}
 }

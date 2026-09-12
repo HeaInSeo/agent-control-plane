@@ -65,7 +65,28 @@ func (t *Tx) RecordPublishAttempt(ctx context.Context, p domain.PublishAttempt) 
 		return err
 	}
 
-	_, err := t.exec(ctx,
+	// The same liveness fence completion applies. Without it a fenced-out
+	// attempt could mint a publication intent for itself, and the row is
+	// undeletable and immutable except for status — so the pending queue
+	// would carry an intent that can only ever resolve to REJECTED.
+	attempt, err := t.WorkerAttempt(ctx, p.AttemptID)
+	if err != nil {
+		return err
+	}
+	if attempt.Status.IsTerminal() {
+		return fmt.Errorf("%w: attempt %s is terminal (%s)",
+			domain.ErrPublishBindingInvalid, string(p.AttemptID), string(attempt.Status))
+	}
+	workspace, err := t.Workspace(ctx, p.WorkspaceID)
+	if err != nil {
+		return err
+	}
+	if workspace.ReleasedAt != nil {
+		return fmt.Errorf("%w: workspace %s is released",
+			domain.ErrPublishBindingInvalid, string(p.WorkspaceID))
+	}
+
+	_, err = t.exec(ctx,
 		`INSERT INTO publish_attempt (publish_attempt_id, task_id, attempt_id,
 		                              scheduler_epoch, fence_epoch, workspace_id,
 		                              repository_subject_id, base_sha, source_commit_sha,

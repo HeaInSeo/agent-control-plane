@@ -453,7 +453,13 @@ func TestStoreStampsCreatedAtWhenAbsent(t *testing.T) {
 		RootPath:            "/var/lib/acp/workspaces/rr-createdat",
 		// CreatedAt deliberately left zero.
 	}
+	// The publication belongs to the live successor and its workspace: a
+	// terminal attempt cannot mint one.
 	pub := publishFor(f, sha("rr-createdat-commit"), "refs/heads/m0/rr-createdat")
+	pub.AttemptID = successor.AttemptID
+	pub.FenceEpoch = successor.FenceEpoch
+	pub.WorkspaceID = ws.WorkspaceID
+	pub.BaseSHA = ws.BaseSHA
 	pub.CreatedAt = time.Time{}
 	pub.IdempotencyKey = ""
 

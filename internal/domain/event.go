@@ -131,6 +131,13 @@ var sensitiveFragments = []string{
 // would permanently destroy ordinary operational data — the workspace path of
 // every attempt, for one — from the history this control plane exists to
 // preserve.
+// A standalone word here is treated as sensitive wherever it appears, which
+// errs toward redaction: a field named "pass-through-count" or "auth-mode"
+// will be redacted even though it holds no credential. That is accepted
+// deliberately. These words are not part of any field name this control
+// plane writes (the event vocabulary is lane, intent, path, patch, attempt,
+// epoch and the like, all verified unaffected), and for a name that genuinely
+// reads as a bare credential word the safe reading is that it holds one.
 var sensitiveTokens = []string{
 	"pat", "pats",
 	// "auth" cannot be a substring: it occurs in author, authored_at,
@@ -216,13 +223,22 @@ func redactValue(v any, depth int) any {
 }
 
 func isSensitiveKey(k string) bool {
-	lower := strings.ToLower(k)
+	words := keyWords(k)
+	// Fragments are matched against both the raw name and its
+	// separator-normalised form, so every spelling of a multi-word credential
+	// name is covered: api_key, apiKey, api-key, API.KEY and the canonical
+	// HTTP header form x-api-key all normalise to a name containing api_key.
+	// Matching only the raw string would let the hyphenated spellings — the
+	// ones that actually appear in headers and config files — through.
+	candidates := [2]string{strings.ToLower(k), strings.Join(words, "_")}
 	for _, frag := range sensitiveFragments {
-		if strings.Contains(lower, frag) {
-			return true
+		for _, candidate := range candidates {
+			if strings.Contains(candidate, frag) {
+				return true
+			}
 		}
 	}
-	for _, word := range keyWords(k) {
+	for _, word := range words {
 		for _, token := range sensitiveTokens {
 			if word == token {
 				return true
