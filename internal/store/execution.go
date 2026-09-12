@@ -15,6 +15,9 @@ import (
 // evidence that derives it.
 var ErrCompletionNotDerivable = errors.New("task completion is not derivable")
 
+// ErrInvalidTaskRun is returned when a task run mutation is incoherent.
+var ErrInvalidTaskRun = errors.New("invalid task run mutation")
+
 // ---------------------------------------------------------------------------
 // TaskRun
 // ---------------------------------------------------------------------------
@@ -27,6 +30,13 @@ func (t *Tx) CreateTaskRun(ctx context.Context, run domain.TaskRun) error {
 	if run.Status == state.TaskCompleted {
 		return fmt.Errorf("%w: a task cannot be created already COMPLETED", ErrCompletionNotDerivable)
 	}
+	// A task cannot be created already pointing at an attempt: an attempt
+	// references its task, so the task has to exist first. Silently dropping
+	// the field would leave the caller believing it had been stored.
+	if run.CurrentAttemptID != nil {
+		return fmt.Errorf("%w: a task cannot be created with a current attempt; "+
+			"create the attempt and then call SetTaskCurrentAttempt", ErrInvalidTaskRun)
+	}
 	now := t.Now()
 	if run.CreatedAt.IsZero() {
 		run.CreatedAt = now
@@ -34,7 +44,7 @@ func (t *Tx) CreateTaskRun(ctx context.Context, run domain.TaskRun) error {
 	if run.UpdatedAt.IsZero() {
 		run.UpdatedAt = now
 	}
-	if _, err := t.tx.ExecContext(ctx,
+	if _, err := t.exec(ctx,
 		`INSERT INTO task_run (task_id, repository_subject_id, packet_id, lane, intent,
 		                       status, current_attempt_id, completed_evidence_id, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
@@ -117,9 +127,42 @@ func (t *Tx) SetTaskRunStatus(ctx context.Context, id ids.TaskID, status state.T
 }
 
 // SetTaskCurrentAttempt points a task at the attempt that currently owns it.
+//
+// The pointer only ever moves forward, to a live attempt. Completion is
+// expressed as "the evidence came from the task's current attempt", so a
+// pointer that could be moved backwards onto a fenced-out attempt would
+// quietly undo that guarantee.
 func (t *Tx) SetTaskCurrentAttempt(ctx context.Context, id ids.TaskID, attempt ids.AttemptID) error {
 	if err := attempt.Validate(); err != nil {
 		return err
+	}
+	candidate, err := t.WorkerAttempt(ctx, attempt)
+	if err != nil {
+		return err
+	}
+	if candidate.TaskID != id {
+		return fmt.Errorf("%w: attempt %s belongs to task %s, not %s",
+			ErrInvalidTaskRun, string(attempt), string(candidate.TaskID), string(id))
+	}
+	if candidate.Status.IsTerminal() {
+		return fmt.Errorf("%w: attempt %s is terminal (%s) and cannot own a task",
+			ErrInvalidTaskRun, string(attempt), string(candidate.Status))
+	}
+
+	run, err := t.TaskRun(ctx, id)
+	if err != nil {
+		return err
+	}
+	if run.CurrentAttemptID != nil {
+		previous, err := t.WorkerAttempt(ctx, *run.CurrentAttemptID)
+		if err != nil {
+			return err
+		}
+		if candidate.FenceEpoch < previous.FenceEpoch {
+			return fmt.Errorf("%w: task %s is at fence epoch %d; attempt %s is at %d",
+				ErrInvalidTaskRun, string(id), int64(previous.FenceEpoch),
+				string(attempt), int64(candidate.FenceEpoch))
+		}
 	}
 	return t.exactlyOne(ctx, "task run", string(id),
 		`UPDATE task_run SET current_attempt_id = ?, updated_at = ? WHERE task_id = ?`,
@@ -136,6 +179,16 @@ func (t *Tx) CompleteTaskRunFromEvidence(ctx context.Context, taskID ids.TaskID,
 	run, err := t.TaskRun(ctx, taskID)
 	if err != nil {
 		return err
+	}
+	// Completion is idempotent for the evidence that established it, and
+	// refused for any other: rebinding a completed task to different
+	// evidence would lose which observation actually established it.
+	if run.Status == state.TaskCompleted {
+		if run.CompletedEvidenceID != nil && *run.CompletedEvidenceID == evidenceID {
+			return nil
+		}
+		return fmt.Errorf("%w: task %s is already COMPLETED on other evidence",
+			ErrCompletionNotDerivable, string(taskID))
 	}
 	ev, err := t.Evidence(ctx, evidenceID)
 	if err != nil {
@@ -164,6 +217,14 @@ func (t *Tx) CompleteTaskRunFromEvidence(ctx context.Context, taskID ids.TaskID,
 	if attempt.Status.IsTerminal() {
 		return fmt.Errorf("%w: attempt %s is terminal (%s)",
 			ErrCompletionNotDerivable, string(attempt.AttemptID), string(attempt.Status))
+	}
+	// Driving a task to COMPLETED is an exercise of scheduler ownership, so
+	// it binds the current generation exactly as admitting an attempt and
+	// recording a publication do. An attempt from a retired epoch stays
+	// readable; it does not get to complete anything. Reconciling work that
+	// straddles a scheduler restart is crash-recovery, a later milestone.
+	if err := t.RequireCurrentEpoch(ctx, attempt.SchedulerEpoch); err != nil {
+		return err
 	}
 	workspace, err := t.WorkspaceForAttempt(ctx, attempt.AttemptID)
 	if err != nil {
@@ -239,7 +300,7 @@ func (t *Tx) CreateWorkerAttempt(ctx context.Context, a domain.WorkerAttempt) er
 	if a.UpdatedAt.IsZero() {
 		a.UpdatedAt = now
 	}
-	if _, err := t.tx.ExecContext(ctx,
+	if _, err := t.exec(ctx,
 		`INSERT INTO worker_attempt (attempt_id, task_id, packet_id, repository_subject_id,
 		                             lane, intent, scheduler_epoch, fence_epoch, status,
 		                             lease_expires_at, last_checkpoint_at, created_at, updated_at)
@@ -311,10 +372,25 @@ func (t *Tx) WorkerAttempt(ctx context.Context, id ids.AttemptID) (domain.Worker
 	}, nil
 }
 
+// ErrForbiddenAttemptTransition is returned when an attempt status change is
+// not a permitted transition.
+var ErrForbiddenAttemptTransition = errors.New("forbidden worker attempt status transition")
+
 // SetWorkerAttemptStatus moves an attempt within WorkerAttemptStatus.
+//
+// Only a permitted transition is accepted: live states move forward and a
+// terminal state is final. The same rule is enforced by a schema trigger.
 func (t *Tx) SetWorkerAttemptStatus(ctx context.Context, id ids.AttemptID, status state.WorkerAttemptStatus) error {
 	if err := status.Validate(); err != nil {
 		return err
+	}
+	current, err := t.WorkerAttempt(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !current.Status.CanTransitionTo(status) {
+		return fmt.Errorf("%w: attempt %s cannot move from %q to %q",
+			ErrForbiddenAttemptTransition, string(id), string(current.Status), string(status))
 	}
 	return t.exactlyOne(ctx, "worker attempt", string(id),
 		`UPDATE worker_attempt SET status = ?, updated_at = ? WHERE attempt_id = ?`,
@@ -333,7 +409,7 @@ func (t *Tx) CreateWorkspace(ctx context.Context, w domain.Workspace) error {
 	if err := w.Validate(); err != nil {
 		return err
 	}
-	if _, err := t.tx.ExecContext(ctx,
+	if _, err := t.exec(ctx,
 		`INSERT INTO workspace (workspace_id, attempt_id, task_id, repository_subject_id,
 		                        base_sha, isolation_kind, root_path, created_at, released_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,

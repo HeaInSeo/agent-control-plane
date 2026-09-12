@@ -66,7 +66,8 @@ func (m Mode) String() string {
 
 // Config configures a database handle.
 type Config struct {
-	// Path is the database file path. In-memory databases are not supported:
+	// Path is the database file path. A relative path is resolved against the
+	// working directory at open time. In-memory databases are not supported:
 	// the control plane's whole purpose is durability.
 	Path string
 	// Mode selects read-write or read-only access.
@@ -107,11 +108,23 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	if cfg.Path == "" {
 		return nil, errors.New("store: Config.Path is required")
 	}
+	// The DSN is a file: URI, and a relative path in one is read as a URI
+	// authority rather than a path — SQLite would reject "file://sub/cp.db"
+	// with an opaque "invalid uri authority" error after stat and MkdirAll
+	// had already run against the relative path. Resolving up front keeps the
+	// path one thing everywhere: the stat, the directory creation, the DSN
+	// and the path reported in errors.
+	absPath, err := filepath.Abs(cfg.Path)
+	if err != nil {
+		return nil, fmt.Errorf("store: resolve database path %q: %w", cfg.Path, err)
+	}
+	cfg.Path = absPath
 
 	state, err := inspectFile(cfg.Path)
 	if err != nil {
 		return nil, err
 	}
+
 	// A zero-length file holds no database. It is what SQLite itself leaves
 	// behind before its first write, and it is also what a stray `touch` or an
 	// abandoned path leaves behind — so for the purpose of the create gates it

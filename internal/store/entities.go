@@ -34,6 +34,19 @@ func (t *Tx) ObserveRepositorySubject(ctx context.Context, subject domain.Reposi
 	switch {
 	case err == nil:
 		if existing.CurrentFullName == subject.CurrentFullName {
+			// Record that the alias was confirmed at this later time. Leaving
+			// observed_at behind would make the staleness guard below compare
+			// against a timestamp that lags reality, so an observation older
+			// than this confirmation could still overwrite the alias.
+			if subject.ObservedAt.After(existing.ObservedAt) {
+				if _, err := t.exec(ctx,
+					`UPDATE repository_subject SET observed_at = ? WHERE github_node_id = ?`,
+					formatTime(subject.ObservedAt), subject.GitHubNodeID,
+				); err != nil {
+					return domain.RepositorySubject{}, fmt.Errorf("refresh repository subject observation: %w", err)
+				}
+				existing.ObservedAt = subject.ObservedAt
+			}
 			return existing, nil
 		}
 		// An observation older than what is already recorded is ignored. A
@@ -44,7 +57,7 @@ func (t *Tx) ObserveRepositorySubject(ctx context.Context, subject domain.Reposi
 		if subject.ObservedAt.Before(existing.ObservedAt) {
 			return existing, nil
 		}
-		if _, err := t.tx.ExecContext(ctx,
+		if _, err := t.exec(ctx,
 			`UPDATE repository_subject SET current_full_name = ?, observed_at = ? WHERE github_node_id = ?`,
 			subject.CurrentFullName, formatTime(subject.ObservedAt), subject.GitHubNodeID,
 		); err != nil {
@@ -75,7 +88,7 @@ func (t *Tx) ObserveRepositorySubject(ctx context.Context, subject domain.Reposi
 		return existing, nil
 
 	case errors.Is(err, ErrNotFound):
-		if _, err := t.tx.ExecContext(ctx,
+		if _, err := t.exec(ctx,
 			`INSERT INTO repository_subject (repository_subject_id, github_node_id, current_full_name, observed_at)
 			 VALUES (?, ?, ?, ?)`,
 			string(subject.RepositorySubjectID), subject.GitHubNodeID,
@@ -201,7 +214,7 @@ func (t *Tx) ApprovePacket(ctx context.Context, p domain.ExecutionPacket) error 
 		return fmt.Errorf("encode stop_conditions: %w", err)
 	}
 
-	if _, err := t.tx.ExecContext(ctx,
+	if _, err := t.exec(ctx,
 		`INSERT INTO execution_packet (
 		    packet_id, task_id, lane, intent, repository_subject_id,
 		    source_revision, source_digest, packet_digest,
@@ -313,7 +326,7 @@ func (t *Tx) SetPacketStatus(ctx context.Context, id ids.PacketID, status state.
 
 // exactlyOne runs an update that must affect exactly one row.
 func (t *Tx) exactlyOne(ctx context.Context, what, id, query string, args ...any) error {
-	res, err := t.tx.ExecContext(ctx, query, args...)
+	res, err := t.exec(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("update %s %s: %w", what, id, err)
 	}

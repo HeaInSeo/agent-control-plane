@@ -33,8 +33,20 @@ var (
 // persisted relation — an attempt without its workspace, a publication without
 // its attempt — is not a reachable state.
 type Tx struct {
-	tx  *sql.Tx
-	now func() time.Time
+	tx       *sql.Tx
+	now      func() time.Time
+	readOnly bool
+}
+
+// exec runs a statement that changes data.
+//
+// Every write in this package goes through here, so a read-only transaction
+// cannot mutate anything regardless of which method the caller reached for.
+func (t *Tx) exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if t.readOnly {
+		return nil, fmt.Errorf("%w: this transaction is read-only", ErrReadOnly)
+	}
+	return t.tx.ExecContext(ctx, query, args...)
 }
 
 // Now returns the transaction's clock. Tests can pin it via WithClock.
@@ -66,7 +78,18 @@ func (db *DB) Write(ctx context.Context, fn func(*Tx) error) error {
 	return db.runTx(ctx, false, fn)
 }
 
-// Read runs fn inside a read transaction.
+// Read runs fn inside a read-only transaction.
+//
+// Read-only is enforced, not merely requested. The driver treats
+// sql.TxOptions.ReadOnly as a hint about which BEGIN to issue and applies no
+// enforcement of its own, so a write inside a Read on a read-write handle
+// would otherwise commit. Every write in this package therefore goes through
+// Tx.exec, which refuses to run in a read-only transaction.
+//
+// The gate is in Go rather than a query_only pragma because the pragma is
+// connection state: on a single-connection store, resetting it has to happen
+// while the transaction still holds that connection, and getting the ordering
+// wrong deadlocks or — worse — leaves the handle read-only for good.
 func (db *DB) Read(ctx context.Context, fn func(*Tx) error) error {
 	return db.runTx(ctx, true, fn)
 }
@@ -85,7 +108,7 @@ func (db *DB) runTx(ctx context.Context, readOnly bool, fn func(*Tx) error) (err
 		}
 	}()
 
-	if err := fn(&Tx{tx: sqlTx, now: db.nowFunc()}); err != nil {
+	if err := fn(&Tx{tx: sqlTx, now: db.nowFunc(), readOnly: readOnly}); err != nil {
 		return err
 	}
 	if err := sqlTx.Commit(); err != nil {
@@ -130,13 +153,13 @@ func (db *DB) ActivateScheduler(ctx context.Context, owner ids.SchedulerOwnerID,
 			return err
 		}
 
-		if _, err := tx.tx.ExecContext(ctx,
+		if _, err := tx.exec(ctx,
 			`INSERT INTO scheduler_epoch (epoch, owner_id, activated_at, activation_reason) VALUES (?, ?, ?, ?)`,
 			int64(next.Epoch), string(next.OwnerID), formatTime(next.ActivatedAt), next.ActivationReason,
 		); err != nil {
 			return fmt.Errorf("activate scheduler: insert epoch: %w", err)
 		}
-		if _, err := tx.tx.ExecContext(ctx,
+		if _, err := tx.exec(ctx,
 			`INSERT INTO scheduler_ownership (id, current_epoch, owner_id, acquired_at) VALUES (1, ?, ?, ?)
 			 ON CONFLICT (id) DO UPDATE SET current_epoch = excluded.current_epoch,
 			                                owner_id      = excluded.owner_id,

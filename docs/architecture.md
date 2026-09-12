@@ -154,11 +154,20 @@ that legitimately transforms commits — a merge-generated commit, say — needs
 its own explicit evidence contract with provenance, not a loosened default.
 
 Completion additionally requires that the evidence come from the attempt that
-currently owns the task, that the attempt is not terminal, and that its
-workspace has not been released. Without those checks a fenced-out attempt's
-evidence would complete a task a successor was still actively running — the
-publication path already revalidated all three, and completion was the
-asymmetric hole.
+currently owns the task, that the attempt is not terminal, that its workspace
+has not been released, and that the attempt's scheduler epoch is current.
+Without those checks a fenced-out attempt's evidence would complete a task a
+successor was still actively running, and a superseded scheduler generation
+could drive a task to COMPLETED on the authority of a retired epoch.
+Recording evidence binds the current epoch for the same reason: it is the
+input completion is derived from. Reconciling work that straddles a scheduler
+restart is crash-recovery, a later milestone, and until it exists the M0
+behaviour is to fail closed.
+
+Completion is also final. Re-completing with the same evidence is idempotent;
+re-completing with different evidence is refused, and the schema forbids
+rebinding `completed_evidence_id` once set, so which observation established
+completion cannot be lost.
 
 Read-only work has its own evidence contract, because it publishes nothing.
 A `READ_ONLY_REVIEW` observation must bind `reviewed_sha` — the fixed commit
@@ -207,6 +216,28 @@ a new approval is a new packet. Both the Go guard
 schema trigger enforce this. Deletion is refused too: a packet no task
 references yet could otherwise be dropped and re-inserted under the same
 identity with a widened scope, which is a content change by another route.
+The same no-delete rule covers `worker_attempt`, `workspace`,
+`publish_attempt`, `evidence_observation` and `event` — every durable
+execution record — since immutability that stops at `UPDATE` is not
+immutability.
+
+`WorkerAttemptStatus` has the same shape of rule. Live states move forward
+only, and a terminal state is final:
+
+```text
+CLAIMED -> STARTING -> RUNNING -> VERIFYING
+any live -> FAILED | ABANDONED | EVIDENCE_UNKNOWN
+FAILED, ABANDONED, EVIDENCE_UNKNOWN are terminal
+```
+
+Reviving a terminal attempt would re-enter the per-repository modifying slot
+whenever it happened to be free and would defeat every guard written in terms
+of a terminal status. A retry is a new attempt with a new fencing token, not a
+resurrected old one. Relatedly, a task's `current_attempt_id` only moves
+forward — to a live attempt whose fence epoch is not lower than the current
+one — because completion is expressed as "the evidence came from the task's
+current attempt", and a pointer that could move backwards would quietly undo
+that guarantee.
 
 `PublishStatus` has the same shape of rule, because a publication recorded
 `REJECTED` that could be flipped to `APPLIED` would be usable to complete a
@@ -249,6 +280,20 @@ transaction.
 
 WAL, a single connection matching the single-active-scheduler model, and
 `BEGIN IMMEDIATE` via `_txlock=immediate`.
+
+`Config.Path` is resolved to an absolute path at open time. The DSN is a
+`file:` URI, and a relative path inside one is read as a URI authority rather
+than a path, so a relative path would otherwise fail with an opaque driver
+error after the stat and directory creation had already succeeded.
+
+`Read` runs a genuinely read-only transaction: the driver treats
+`sql.TxOptions.ReadOnly` as a hint about which `BEGIN` to issue and enforces
+nothing, so every write in the package goes through one gate that refuses to
+run inside a read transaction. The gate is in Go rather than a `query_only`
+pragma because that pragma is connection state, and on a single-connection
+store resetting it has to happen while the transaction still holds the
+connection — get the ordering wrong and it deadlocks, or worse leaves the
+handle read-only permanently.
 
 Per-connection pragmas — `foreign_keys`, `synchronous = FULL`, and
 `query_only` on read-only handles — are carried in the DSN, not applied once

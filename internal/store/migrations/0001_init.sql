@@ -256,6 +256,37 @@ BEGIN
     SELECT RAISE(ABORT, 'current_attempt_id must belong to this task');
 END;
 
+-- The pointer only moves forward, and only onto a live attempt. Completion is
+-- expressed as "the evidence came from the task's current attempt", so a
+-- pointer that could be moved backwards onto a fenced-out attempt would
+-- quietly undo that guarantee.
+CREATE TRIGGER trg_task_run_current_attempt_forward
+BEFORE UPDATE OF current_attempt_id ON task_run
+FOR EACH ROW
+WHEN NEW.current_attempt_id IS NOT NULL
+  AND NEW.current_attempt_id IS NOT OLD.current_attempt_id
+  AND (
+        (SELECT status FROM worker_attempt WHERE attempt_id = NEW.current_attempt_id)
+            IN ('FAILED', 'ABANDONED', 'EVIDENCE_UNKNOWN')
+     OR (OLD.current_attempt_id IS NOT NULL
+         AND (SELECT fence_epoch FROM worker_attempt WHERE attempt_id = NEW.current_attempt_id)
+             < (SELECT fence_epoch FROM worker_attempt WHERE attempt_id = OLD.current_attempt_id))
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'current_attempt_id must move forward to a live attempt');
+END;
+
+-- #5: completion evidence, once bound, is the observation that established
+-- completion. Rebinding it would lose which observation actually did.
+CREATE TRIGGER trg_task_run_completion_evidence_final
+BEFORE UPDATE OF completed_evidence_id ON task_run
+FOR EACH ROW
+WHEN OLD.completed_evidence_id IS NOT NULL
+ AND NEW.completed_evidence_id IS NOT OLD.completed_evidence_id
+BEGIN
+    SELECT RAISE(ABORT, 'completion evidence is final once bound');
+END;
+
 -- ---------------------------------------------------------------------------
 -- WorkerAttempt: one bounded execution, fenced within its task and bound to
 -- the scheduler generation that admitted it.
@@ -326,15 +357,47 @@ END;
 CREATE TRIGGER trg_worker_attempt_identity_immutable
 BEFORE UPDATE ON worker_attempt
 FOR EACH ROW
-WHEN NEW.attempt_id            <> OLD.attempt_id
-  OR NEW.task_id               <> OLD.task_id
-  OR NEW.packet_id             <> OLD.packet_id
-  OR NEW.repository_subject_id <> OLD.repository_subject_id
-  OR NEW.scheduler_epoch       <> OLD.scheduler_epoch
-  OR NEW.fence_epoch           <> OLD.fence_epoch
-  OR NEW.intent                <> OLD.intent
+WHEN NEW.attempt_id            IS NOT OLD.attempt_id
+  OR NEW.task_id               IS NOT OLD.task_id
+  OR NEW.packet_id             IS NOT OLD.packet_id
+  OR NEW.repository_subject_id IS NOT OLD.repository_subject_id
+  OR NEW.scheduler_epoch       IS NOT OLD.scheduler_epoch
+  OR NEW.fence_epoch           IS NOT OLD.fence_epoch
+  OR NEW.intent                IS NOT OLD.intent
+  -- lane included: the coherence trigger is INSERT-only, so without this an
+  -- attempt's lane could drift from its task's after admission.
+  OR NEW.lane                  IS NOT OLD.lane
+  OR NEW.created_at            IS NOT OLD.created_at
 BEGIN
     SELECT RAISE(ABORT, 'worker_attempt identity is immutable');
+END;
+
+-- Permitted attempt status transitions only: live states move forward, and a
+-- terminal state is final. Reviving a fenced-out, failed or evidence-unknown
+-- attempt would re-enter the per-repository modifying slot whenever it
+-- happened to be free, and would defeat every guard written in terms of a
+-- terminal status. A retry is a new attempt with a new fencing token.
+CREATE TRIGGER trg_worker_attempt_status_transition
+BEFORE UPDATE OF status ON worker_attempt
+FOR EACH ROW
+WHEN NEW.status IS NOT OLD.status
+ AND NOT (
+        (OLD.status = 'CLAIMED'   AND NEW.status IN ('STARTING', 'RUNNING', 'VERIFYING', 'FAILED', 'ABANDONED', 'EVIDENCE_UNKNOWN'))
+     OR (OLD.status = 'STARTING'  AND NEW.status IN ('RUNNING', 'VERIFYING', 'FAILED', 'ABANDONED', 'EVIDENCE_UNKNOWN'))
+     OR (OLD.status = 'RUNNING'   AND NEW.status IN ('VERIFYING', 'FAILED', 'ABANDONED', 'EVIDENCE_UNKNOWN'))
+     OR (OLD.status = 'VERIFYING' AND NEW.status IN ('FAILED', 'ABANDONED', 'EVIDENCE_UNKNOWN'))
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'forbidden worker attempt status transition');
+END;
+
+-- Durable execution records are never deleted. Without this, a row could be
+-- dropped and re-inserted under the same identity with different content,
+-- which is a content change by another route.
+CREATE TRIGGER trg_worker_attempt_no_delete
+BEFORE DELETE ON worker_attempt
+BEGIN
+    SELECT RAISE(ABORT, 'worker attempts are durable and cannot be deleted');
 END;
 
 -- ---------------------------------------------------------------------------
@@ -371,13 +434,25 @@ END;
 CREATE TRIGGER trg_workspace_ownership_immutable
 BEFORE UPDATE ON workspace
 FOR EACH ROW
-WHEN NEW.attempt_id            <> OLD.attempt_id
-  OR NEW.task_id               <> OLD.task_id
-  OR NEW.repository_subject_id <> OLD.repository_subject_id
-  OR NEW.base_sha              <> OLD.base_sha
-  OR NEW.root_path             <> OLD.root_path
+WHEN NEW.workspace_id          IS NOT OLD.workspace_id
+  OR NEW.attempt_id            IS NOT OLD.attempt_id
+  OR NEW.task_id               IS NOT OLD.task_id
+  OR NEW.repository_subject_id IS NOT OLD.repository_subject_id
+  OR NEW.base_sha              IS NOT OLD.base_sha
+  OR NEW.root_path             IS NOT OLD.root_path
+  -- isolation_kind included: the coherence trigger is INSERT-only, so
+  -- without this a READ_ONLY_CHECKOUT could be relabelled an ISOLATED_CLONE
+  -- after the fact. Only released_at is meant to change.
+  OR NEW.isolation_kind        IS NOT OLD.isolation_kind
+  OR NEW.created_at            IS NOT OLD.created_at
 BEGIN
     SELECT RAISE(ABORT, 'workspace ownership is immutable; a workspace cannot be rebound to another attempt');
+END;
+
+CREATE TRIGGER trg_workspace_no_delete
+BEFORE DELETE ON workspace
+BEGIN
+    SELECT RAISE(ABORT, 'workspaces are durable and cannot be deleted');
 END;
 
 -- ---------------------------------------------------------------------------
@@ -483,6 +558,12 @@ BEGIN
     SELECT RAISE(ABORT, 'publish_attempt identity is immutable; only status may change');
 END;
 
+CREATE TRIGGER trg_publish_attempt_no_delete
+BEFORE DELETE ON publish_attempt
+BEGIN
+    SELECT RAISE(ABORT, 'publication records are durable and cannot be deleted');
+END;
+
 -- ---------------------------------------------------------------------------
 -- EvidenceObservation (CC7): exact-attempt, exact-published-SHA identity.
 -- ---------------------------------------------------------------------------
@@ -561,6 +642,16 @@ BEFORE UPDATE ON evidence_observation
 FOR EACH ROW
 BEGIN
     SELECT RAISE(ABORT, 'evidence observations are immutable');
+END;
+
+-- Immutable means undeletable too: an un-referenced observation could
+-- otherwise be dropped and re-inserted under the same evidence_id with
+-- different content, which is what makes the artifact digest a binding rather
+-- than a note.
+CREATE TRIGGER trg_evidence_no_delete
+BEFORE DELETE ON evidence_observation
+BEGIN
+    SELECT RAISE(ABORT, 'evidence observations are immutable and cannot be deleted');
 END;
 
 -- ---------------------------------------------------------------------------

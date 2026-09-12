@@ -101,7 +101,14 @@ Defences in M0:
   fence epoch, repository subject and workspace.
 - Completion requires the evidence to come from the task's current,
   non-terminal attempt with an unreleased workspace, so a fenced-out attempt
-  cannot complete a task a successor is still running.
+  cannot complete a task a successor is still running. The task's
+  current-attempt pointer only moves forward to a live attempt, so the guard
+  cannot be undone by moving the pointer back.
+- Completion is final: re-completing with different evidence is refused, and
+  the schema forbids rebinding the completion evidence once set.
+- A terminal attempt cannot be revived, so a status marked FAILED, ABANDONED
+  or EVIDENCE_UNKNOWN cannot re-enter the modifying slot or reacquire the
+  ability to complete anything.
 - A publication that was recorded `REJECTED` cannot be flipped back to
   `APPLIED` and then used to complete a task; `OBSERVED` and `REJECTED` are
   terminal and nothing returns to `PENDING`.
@@ -126,8 +133,11 @@ partition or takeover — continues to admit attempts or publish.
 Defences in M0:
 
 - Ownership is a singleton row whose `current_epoch` may only move forward.
-- Attempts and publications must bind the current epoch, enforced in Go and by
-  trigger.
+- Attempts, publications, evidence observations and completions must all bind
+  the current epoch. Admission and publication are enforced in Go and by
+  trigger; evidence and completion are enforced in Go, because the schema can
+  only see that an observation matches its own attempt's epoch, which a
+  retired attempt satisfies trivially.
 - Per-task fencing tokens (`fence_epoch`) are monotonic and unique within a
   task, so a fenced-out attempt cannot reissue its own token.
 - Opening the database, checking integrity, verifying the schema or reading
@@ -202,7 +212,10 @@ Defences in M0:
   idempotent and never adopts a file whose marker names another owner.
 - Each migration and its ledger entry share one transaction, so a failed step
   leaves neither its schema changes nor a record claiming it succeeded.
-- Event history rejects `UPDATE` and `DELETE`.
+- Event history rejects `UPDATE` and `DELETE`, and every other durable
+  execution record — packets, attempts, workspaces, publications, evidence —
+  rejects `DELETE`, so a row cannot be dropped and re-inserted under the same
+  identity with different content.
 
 ## Secrets in history
 

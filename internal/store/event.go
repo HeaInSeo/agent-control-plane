@@ -39,7 +39,7 @@ func (t *Tx) AppendEvent(ctx context.Context, e domain.Event) (int64, error) {
 		return 0, err
 	}
 
-	if _, err := t.tx.ExecContext(ctx,
+	if _, err := t.exec(ctx,
 		`INSERT INTO event (scheduler_epoch, seq, event_id, occurred_at, event_type,
 		                    subject_kind, subject_id, task_id, attempt_id, fields)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -135,7 +135,7 @@ func (t *Tx) AppendEventAt(ctx context.Context, e domain.Event, seq int64) error
 	if err != nil {
 		return err
 	}
-	if _, err := t.tx.ExecContext(ctx,
+	if _, err := t.exec(ctx,
 		`INSERT INTO event (scheduler_epoch, seq, event_id, occurred_at, event_type,
 		                    subject_kind, subject_id, task_id, attempt_id, fields)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,

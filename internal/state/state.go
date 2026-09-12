@@ -223,6 +223,44 @@ func (s WorkerAttemptStatus) HoldsModifyingSlot() bool {
 	}
 }
 
+// CanTransitionTo reports whether moving an attempt from s to next is a
+// permitted transition.
+//
+// Live states only ever move forward, and a terminal state is final: an
+// attempt that was fenced out, failed, or ended with unresolved evidence must
+// not come back to life. Reviving one would re-enter the per-repository
+// modifying slot whenever it happened to be free, and would defeat every
+// guard written in terms of IsTerminal. A retry is a new attempt with a new
+// fencing token, not a resurrected old one.
+func (s WorkerAttemptStatus) CanTransitionTo(next WorkerAttemptStatus) bool {
+	if s == next {
+		return true
+	}
+	if s.IsTerminal() {
+		return false
+	}
+	if next.IsTerminal() {
+		return true
+	}
+	return attemptProgress(next) > attemptProgress(s)
+}
+
+// attemptProgress orders the live attempt states.
+func attemptProgress(s WorkerAttemptStatus) int {
+	switch s {
+	case AttemptClaimed:
+		return 1
+	case AttemptStarting:
+		return 2
+	case AttemptRunning:
+		return 3
+	case AttemptVerifying:
+		return 4
+	default:
+		return 0
+	}
+}
+
 // IsTerminal reports whether the attempt has stopped for good.
 func (s WorkerAttemptStatus) IsTerminal() bool {
 	switch s {

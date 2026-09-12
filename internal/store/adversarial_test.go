@@ -1182,6 +1182,16 @@ func TestTaskCannotPointAtAnotherTasksAttempt(t *testing.T) {
 	err := db.Write(ctx, func(tx *store.Tx) error {
 		return tx.SetTaskCurrentAttempt(ctx, a.Task.TaskID, b.Attempt.AttemptID)
 	})
+	if !errors.Is(err, store.ErrInvalidTaskRun) {
+		t.Fatalf("want ErrInvalidTaskRun, got %v", err)
+	}
+
+	// The schema must refuse it too, not only the Go guard.
+	err = db.Write(ctx, func(tx *store.Tx) error {
+		return tx.ExecForTest(ctx,
+			`UPDATE task_run SET current_attempt_id = ? WHERE task_id = ?`,
+			string(b.Attempt.AttemptID), string(a.Task.TaskID))
+	})
 	if err == nil {
 		t.Fatal("a task was pointed at another task's attempt")
 	}
@@ -1270,14 +1280,26 @@ func TestTerminalAttemptCannotBeRevivedIntoAHeldModifyingSlot(t *testing.T) {
 	}
 
 	// The fenced-out attempt must not be able to make itself live again.
+	// Revival is refused outright by the transition rule, which is stronger
+	// than relying on the modifying-slot index to happen to be occupied.
 	err := db.Write(ctx, func(tx *store.Tx) error {
 		return tx.SetWorkerAttemptStatus(ctx, f.Attempt.AttemptID, state.AttemptRunning)
+	})
+	if !errors.Is(err, store.ErrForbiddenAttemptTransition) {
+		t.Fatalf("want ErrForbiddenAttemptTransition, got %v", err)
+	}
+
+	// And at schema level.
+	err = db.Write(ctx, func(tx *store.Tx) error {
+		return tx.ExecForTest(ctx,
+			`UPDATE worker_attempt SET status = 'RUNNING' WHERE attempt_id = ?`,
+			string(f.Attempt.AttemptID))
 	})
 	if err == nil {
 		t.Fatal("a fenced-out attempt reclaimed the modifying slot")
 	}
-	if !strings.Contains(strings.ToLower(err.Error()), "unique") {
-		t.Fatalf("expected the modifying-slot index to reject it, got: %v", err)
+	if !strings.Contains(err.Error(), "forbidden worker attempt status transition") {
+		t.Fatalf("expected the transition trigger to fire, got: %v", err)
 	}
 }
 

@@ -19,7 +19,7 @@ func (db *DB) BootstrapForTest(ctx context.Context) error {
 // constraints and triggers are load-bearing rather than decorative. No
 // production code path can reach it.
 func (t *Tx) ExecForTest(ctx context.Context, query string, args ...any) error {
-	_, err := t.tx.ExecContext(ctx, query, args...)
+	_, err := t.exec(ctx, query, args...)
 	return err
 }
 

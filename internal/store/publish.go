@@ -49,7 +49,7 @@ func (t *Tx) RecordPublishAttempt(ctx context.Context, p domain.PublishAttempt) 
 		return err
 	}
 
-	_, err := t.tx.ExecContext(ctx,
+	_, err := t.exec(ctx,
 		`INSERT INTO publish_attempt (publish_attempt_id, task_id, attempt_id,
 		                              scheduler_epoch, fence_epoch, workspace_id,
 		                              repository_subject_id, base_sha, source_commit_sha,
@@ -157,6 +157,13 @@ func (t *Tx) RecordEvidence(ctx context.Context, e domain.EvidenceObservation) e
 	if err != nil {
 		return err
 	}
+	// Appending evidence under a retired generation would let a superseded
+	// scheduler manufacture the input that completion is derived from. The
+	// schema trigger only requires the observation's epoch to match its
+	// attempt's, which an old-epoch attempt satisfies trivially.
+	if err := t.RequireCurrentEpoch(ctx, attempt.SchedulerEpoch); err != nil {
+		return err
+	}
 	workspace, err := t.WorkspaceForAttempt(ctx, e.AttemptID)
 	if err != nil {
 		return err
@@ -172,7 +179,7 @@ func (t *Tx) RecordEvidence(ctx context.Context, e domain.EvidenceObservation) e
 		return err
 	}
 
-	if _, err := t.tx.ExecContext(ctx,
+	if _, err := t.exec(ctx,
 		`INSERT INTO evidence_observation (evidence_id, task_id, attempt_id, scheduler_epoch,
 		                                   fence_epoch, repository_subject_id, workspace_id,
 		                                   publish_attempt_id, published_sha, observed_sha,
