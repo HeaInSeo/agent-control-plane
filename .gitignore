@@ -1,0 +1,29 @@
+# Binaries / build output
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Go coverage / profiling
+*.prof
+coverage.txt
+coverage.html
+
+# Local scheduler state (never commit a control-plane database)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Local environment / credentials
+.env
+.env.*
+*.pem
+*.key
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store
