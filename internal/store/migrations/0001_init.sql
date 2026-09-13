@@ -213,6 +213,12 @@ CREATE TABLE task_run (
     created_at            TEXT NOT NULL,
     updated_at            TEXT NOT NULL,
 
+    -- Timestamps sort lexicographically in this layout, so "the row cannot
+    -- claim it changed before it existed" is expressible here. A backward
+    -- clock step would otherwise store an untrue updated_at that no path can
+    -- correct, since task_run rejects DELETE.
+    CHECK (updated_at >= created_at),
+
     -- I1: worker exit is not completion. COMPLETED cannot exist without a
     -- bound evidence observation, and evidence cannot exist without matching
     -- attempt identity (see evidence_observation triggers).
@@ -411,6 +417,8 @@ CREATE TABLE worker_attempt (
     created_at            TEXT NOT NULL,
     updated_at            TEXT NOT NULL,
 
+    CHECK (updated_at >= created_at),
+
     UNIQUE (task_id, fence_epoch)
 ) WITHOUT ROWID;
 
@@ -542,7 +550,9 @@ CREATE TABLE workspace (
     root_path             TEXT NOT NULL UNIQUE CHECK (length(root_path) > 0),
 
     created_at            TEXT NOT NULL,
-    released_at           TEXT
+    released_at           TEXT,
+
+    CHECK (released_at IS NULL OR released_at >= created_at)
 ) WITHOUT ROWID;
 
 CREATE TRIGGER trg_workspace_attempt_coherence

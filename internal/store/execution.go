@@ -206,7 +206,7 @@ func (t *Tx) SetTaskRunStatus(ctx context.Context, id ids.TaskID, status state.T
 	}
 	return t.exactlyOne(ctx, "task run", string(id),
 		`UPDATE task_run SET status = ?, updated_at = ? WHERE task_id = ?`,
-		string(status), formatTime(t.Now()), string(id))
+		string(status), formatTime(t.monotonicNow(current.UpdatedAt)), string(id))
 }
 
 // SetTaskCurrentAttempt points a task at the attempt that currently owns it.
@@ -265,9 +265,15 @@ func (t *Tx) SetTaskCurrentAttempt(ctx context.Context, id ids.TaskID, attempt i
 				string(attempt), int64(candidate.FenceEpoch))
 		}
 	}
+	// Re-asserting the attempt a task already points at is a no-op, as for
+	// every status setter. The forward-only trigger is guarded on the value
+	// changing, so without this the write would land and rewrite updated_at.
+	if run.CurrentAttemptID != nil && *run.CurrentAttemptID == attempt {
+		return nil
+	}
 	return t.exactlyOne(ctx, "task run", string(id),
 		`UPDATE task_run SET current_attempt_id = ?, updated_at = ? WHERE task_id = ?`,
-		string(attempt), formatTime(t.Now()), string(id))
+		string(attempt), formatTime(t.monotonicNow(run.UpdatedAt)), string(id))
 }
 
 // CompleteTaskRunFromEvidence is the only way a task reaches COMPLETED.
@@ -376,7 +382,8 @@ func (t *Tx) CompleteTaskRunFromEvidence(ctx context.Context, taskID ids.TaskID,
 
 	return t.exactlyOne(ctx, "task run", string(taskID),
 		`UPDATE task_run SET status = ?, completed_evidence_id = ?, updated_at = ? WHERE task_id = ?`,
-		string(derived), string(evidenceID), formatTime(t.Now()), string(taskID))
+		string(derived), string(evidenceID),
+		formatTime(t.monotonicNow(run.UpdatedAt)), string(taskID))
 }
 
 // ---------------------------------------------------------------------------
@@ -557,7 +564,7 @@ func (t *Tx) SetWorkerAttemptStatus(ctx context.Context, id ids.AttemptID, statu
 	}
 	return t.exactlyOne(ctx, "worker attempt", string(id),
 		`UPDATE worker_attempt SET status = ?, updated_at = ? WHERE attempt_id = ?`,
-		string(status), formatTime(t.Now()), string(id))
+		string(status), formatTime(t.monotonicNow(current.UpdatedAt)), string(id))
 }
 
 // ---------------------------------------------------------------------------
@@ -714,5 +721,5 @@ func (t *Tx) ReleaseWorkspace(ctx context.Context, id ids.WorkspaceID) error {
 	}
 	return t.exactlyOne(ctx, "workspace", string(id),
 		`UPDATE workspace SET released_at = ? WHERE workspace_id = ?`,
-		formatTime(t.Now()), string(id))
+		formatTime(t.monotonicNow(existing.CreatedAt)), string(id))
 }

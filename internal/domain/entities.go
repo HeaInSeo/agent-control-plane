@@ -148,6 +148,10 @@ func (t TaskRun) Validate() error {
 			return fmt.Errorf("%w: completed_evidence_id: %w", ErrInvalidEntity, err)
 		}
 	}
+	if !t.CreatedAt.IsZero() && !t.UpdatedAt.IsZero() && t.UpdatedAt.Before(t.CreatedAt) {
+		return fmt.Errorf("%w: updated_at %s precedes created_at %s",
+			ErrInvalidEntity, t.UpdatedAt.UTC(), t.CreatedAt.UTC())
+	}
 	if t.Status == state.TaskCompleted && t.CompletedEvidenceID == nil {
 		return fmt.Errorf("%w: COMPLETED requires completed_evidence_id (worker exit is not completion)", ErrInvalidEntity)
 	}
@@ -203,6 +207,10 @@ func (a WorkerAttempt) Validate() error {
 	}
 	if err := a.Status.Validate(); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidEntity, err)
+	}
+	if !a.CreatedAt.IsZero() && !a.UpdatedAt.IsZero() && a.UpdatedAt.Before(a.CreatedAt) {
+		return fmt.Errorf("%w: updated_at %s precedes created_at %s",
+			ErrInvalidEntity, a.UpdatedAt.UTC(), a.CreatedAt.UTC())
 	}
 	// Optional, but not optionally meaningless. A caller dereferencing an
 	// unset struct field would otherwise store a lease that expired in year

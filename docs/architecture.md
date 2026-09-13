@@ -141,9 +141,18 @@ undeletable and immutable except for status, so an intent minted by a
 fenced-out attempt would sit in the pending queue for ever, resolvable only to
 `REJECTED`.
 
+Every timestamp that records "when this row last changed" is written
+monotonically, clamped to what the row already holds, and the ordering is a
+schema `CHECK` as well. A backward clock step — an NTP correction, a VM
+resume — would otherwise store a row claiming it changed before it existed,
+and since these rows are immutable or undeletable that claim could never be
+corrected. Clamping loses a little precision on a clock glitch and keeps the
+invariant, which is the better trade.
+
 A publication also records when its status last moved, and each transition
-appends an event. Re-asserting a status is a no-op everywhere it can be
-re-asserted — publications, attempts and tasks alike. Both the crash-recovery
+appends an event. Re-asserting a value is a no-op everywhere it can be
+re-asserted — publication, attempt, task and packet statuses, and a task's
+current attempt alike. Both the crash-recovery
 flow and a periodic reconciler re-assert, and treating that as a move would
 rewrite `updated_at` — which means "when the status last moved" — append a
 phantom transition per cycle to a table nothing can prune, and let a

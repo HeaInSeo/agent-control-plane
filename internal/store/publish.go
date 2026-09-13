@@ -316,10 +316,7 @@ func (t *Tx) SetPublishStatus(ctx context.Context, id ids.PublishAttemptID, stat
 	// since CheckPublishPreconditions starts with Validate, the crash-
 	// recovery path would report a binding failure for a publication that is
 	// otherwise fine.
-	now := t.Now()
-	if now.Before(current.UpdatedAt) {
-		now = current.UpdatedAt
-	}
+	now := t.monotonicNow(current.UpdatedAt)
 	if err := t.exactlyOne(ctx, "publish attempt", string(id),
 		`UPDATE publish_attempt SET status = ?, updated_at = ? WHERE publish_attempt_id = ?`,
 		string(status), formatTime(now), string(id)); err != nil {

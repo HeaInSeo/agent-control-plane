@@ -283,6 +283,14 @@ func (s WorkerAttemptStatus) CanTransitionTo(next WorkerAttemptStatus) bool {
 	if s.IsTerminal() {
 		return false
 	}
+	// An unrecognised source must fail closed, as it does for TaskRunStatus
+	// and PublishStatus. Without this, attemptProgress returns 0 for an
+	// unknown status, so every live target compares greater and every
+	// terminal target is permitted — the same fail-open shape that made
+	// "".IsTerminal() == false a hole in the publish gate.
+	if err := s.Validate(); err != nil {
+		return false
+	}
 	if next.IsTerminal() {
 		return true
 	}

@@ -94,6 +94,22 @@ func (t *Tx) exec(ctx context.Context, query string, args ...any) (sql.Result, e
 // Now returns the transaction's clock. Tests can pin it via WithClock.
 func (t *Tx) Now() time.Time { return t.now().UTC() }
 
+// monotonicNow returns the later of the transaction clock and floor.
+//
+// Every timestamp that records "when this row last changed" goes through
+// here. A backward clock step — an NTP correction, a VM resume, a manual set
+// — would otherwise store a row claiming it changed before it was created,
+// and since these rows are immutable or undeletable that claim could never be
+// corrected. Clamping loses a little precision on a clock glitch and keeps
+// the ordering invariant, which is the better trade.
+func (t *Tx) monotonicNow(floor time.Time) time.Time {
+	now := t.Now()
+	if now.Before(floor) {
+		return floor
+	}
+	return now
+}
+
 // WithClock returns a handle that uses the given clock. It is intended for
 // tests that need deterministic timestamps.
 func (db *DB) WithClock(now func() time.Time) *DB {
