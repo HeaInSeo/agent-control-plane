@@ -670,7 +670,13 @@ CREATE TABLE publish_attempt (
     -- carries released_at; without this the single most irreversible entity
     -- would be the one recording nothing about when it changed, which is
     -- exactly what a publisher resuming after a crash needs to know.
-    updated_at            TEXT NOT NULL
+    updated_at            TEXT NOT NULL,
+
+    -- Timestamps are lexicographically ordered in this layout, so the
+    -- ordering invariant the domain validator enforces is expressible here
+    -- too. Without it a clock step back would silently store a row the
+    -- validator then refuses to load.
+    CHECK (updated_at >= created_at)
 ) WITHOUT ROWID;
 
 CREATE INDEX ix_publish_attempt_attempt ON publish_attempt (attempt_id);

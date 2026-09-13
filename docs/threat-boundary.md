@@ -316,9 +316,15 @@ what stops a fenced-out attempt from completing work a successor is running.
 But `WorkerAttemptStatus` has no success-flavoured terminal state: `FAILED`,
 `ABANDONED` and `EVIDENCE_UNKNOWN` all describe a failure. So after a task
 completes, its attempt is still live and still occupies the single per-
-`RepositorySubject` modifying slot, and the only way to free that slot is to
-record a successful attempt as a failed one — which would falsify the durable
-record the control plane exists to keep.
+`RepositorySubject` modifying slot.
+
+To be precise about the consequence: the repository is **not** permanently
+wedged. Retiring the completing attempt does free the slot, and is permitted.
+But the only statuses available for that are failure statuses, so freeing the
+slot costs a false durable record — the attempt that succeeded goes on record
+as abandoned, in a table that rejects `UPDATE` and `DELETE`. The defect is
+that the control plane's own history has to be falsified to keep scheduling,
+not that scheduling stops.
 
 Two candidate resolutions, both of which change a contract specified in the
 M0 packet:
@@ -330,5 +336,5 @@ M0 packet:
    trigger that joins to `task_run`.
 
 Neither is taken unilaterally. `TestCompletedTaskStillHoldsModifyingSlot_KnownEscalation`
-pins the current constrained behaviour so the gap is visible rather than
-latent, and will fail if the behaviour changes.
+pins the current behaviour — including the escape hatch and its cost — so the
+gap is visible rather than latent, and will fail if the behaviour changes.

@@ -356,6 +356,13 @@ func (t *Tx) SetPacketStatus(ctx context.Context, id ids.PacketID, status state.
 		return fmt.Errorf("%w: packet %s cannot move from %q to %q",
 			ErrForbiddenPacketTransition, string(id), string(current.Status), string(status))
 	}
+	// Re-asserting the current status is a no-op, as for tasks, attempts and
+	// publications. Inert today only because execution_packet has no
+	// updated_at; the moment one is added, or a transition event is appended
+	// here, this would be the one sibling still treating a no-op as a move.
+	if status == current.Status {
+		return nil
+	}
 	return t.exactlyOne(ctx, "execution packet", string(id),
 		`UPDATE execution_packet SET status = ? WHERE packet_id = ?`, string(status), string(id))
 }

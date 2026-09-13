@@ -54,8 +54,19 @@ func (t *Tx) requireLiveTask(ctx context.Context, id ids.TaskID) error {
 var ErrModifyingSlotBusy = errors.New("repository already has a live modifying attempt")
 
 // ErrWorkspaceConflict is returned when a workspace would collide with an
-// existing one, on its attempt or on its directory.
+// existing one, or is incoherent with the attempt that would own it.
 var ErrWorkspaceConflict = errors.New("workspace conflicts with an existing workspace")
+
+// isolationFor reports the isolation kind an attempt of this intent requires.
+//
+// CC3's rule is a fresh isolated clone per modifying attempt, so the kind
+// follows from the intent rather than being chosen freely.
+func isolationFor(intent state.Intent) domain.IsolationKind {
+	if intent == state.IntentModifying {
+		return domain.IsolationIsolatedClone
+	}
+	return domain.IsolationReadOnlyCheckout
+}
 
 // ---------------------------------------------------------------------------
 // TaskRun
@@ -564,6 +575,15 @@ func (t *Tx) CreateWorkspace(ctx context.Context, w domain.Workspace) error {
 	if err := w.Validate(); err != nil {
 		return err
 	}
+	// A workspace is created live. Silently dropping a supplied ReleasedAt —
+	// the INSERT writes NULL — would leave the caller believing it had stored
+	// a released workspace while every released-workspace guard downstream
+	// saw a live one.
+	if w.ReleasedAt != nil {
+		return fmt.Errorf("%w: a workspace cannot be created already released; "+
+			"create it and then call ReleaseWorkspace", ErrWorkspaceConflict)
+	}
+
 	// The same liveness fence publication applies. A workspace row is
 	// undeletable and its root_path is unique, so handing one to a terminal
 	// attempt burns that directory for good on a workspace that can never be
@@ -571,6 +591,22 @@ func (t *Tx) CreateWorkspace(ctx context.Context, w domain.Workspace) error {
 	attempt, err := t.WorkerAttempt(ctx, w.AttemptID)
 	if err != nil {
 		return err
+	}
+	// Checked here as well as by trigger, so a mis-wired workspace is a typed
+	// refusal rather than a raw constraint failure a caller cannot tell apart
+	// from a corrupt database.
+	if w.TaskID != attempt.TaskID {
+		return fmt.Errorf("%w: attempt %s belongs to task %s, not %s",
+			ErrWorkspaceConflict, string(w.AttemptID), string(attempt.TaskID), string(w.TaskID))
+	}
+	if w.RepositorySubjectID != attempt.RepositorySubjectID {
+		return fmt.Errorf("%w: attempt %s operates on repository subject %s, not %s",
+			ErrWorkspaceConflict, string(w.AttemptID),
+			string(attempt.RepositorySubjectID), string(w.RepositorySubjectID))
+	}
+	if want := isolationFor(attempt.Intent); w.IsolationKind != want {
+		return fmt.Errorf("%w: a %s attempt requires isolation %s, not %s",
+			ErrWorkspaceConflict, string(attempt.Intent), string(want), string(w.IsolationKind))
 	}
 	if err := t.RequireCurrentEpoch(ctx, attempt.SchedulerEpoch); err != nil {
 		return err

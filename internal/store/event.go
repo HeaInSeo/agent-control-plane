@@ -77,13 +77,53 @@ func attemptIDArg(id *ids.AttemptID) any {
 	return string(*id)
 }
 
+// maxEventsPerRead bounds a single history read.
+//
+// An epoch lasts as long as a scheduler generation and the event table can
+// never be pruned, so an unbounded read would eventually pull a whole
+// generation's history into memory. The cap is far above any plausible test
+// or inspection and exists so that growth surfaces as an error naming the
+// paginated accessor rather than as memory pressure.
+const maxEventsPerRead = 100_000
+
+// ErrHistoryTooLarge is returned when a single history read would exceed
+// maxEventsPerRead.
+var ErrHistoryTooLarge = errors.New("history read exceeds the per-read limit")
+
 // EventsInEpoch returns the history of one scheduler generation, in sequence
 // order. Events from earlier epochs remain readable for ever.
+//
+// This reads the whole epoch, bounded by maxEventsPerRead. Replay and any
+// other caller that may face a long-lived generation should use
+// EventsInEpochPage instead.
 func (t *Tx) EventsInEpoch(ctx context.Context, epoch domain.Epoch) ([]domain.Event, error) {
+	events, err := t.EventsInEpochPage(ctx, epoch, 0, maxEventsPerRead+1)
+	if err != nil {
+		return nil, err
+	}
+	if len(events) > maxEventsPerRead {
+		return nil, fmt.Errorf("%w: epoch %d has more than %d events; use EventsInEpochPage",
+			ErrHistoryTooLarge, int64(epoch), maxEventsPerRead)
+	}
+	return events, nil
+}
+
+// EventsInEpochPage returns up to limit events of one epoch with a sequence
+// number greater than afterSeq, in sequence order.
+//
+// Paging on (epoch, seq) rather than an offset means a page boundary cannot
+// shift under a concurrent append: seq is monotonic within an epoch and
+// history is append-only, so the next page always starts exactly where the
+// last one ended.
+func (t *Tx) EventsInEpochPage(ctx context.Context, epoch domain.Epoch, afterSeq int64, limit int) ([]domain.Event, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("read events: limit must be positive, got %d", limit)
+	}
 	rows, err := t.tx.QueryContext(ctx,
 		`SELECT scheduler_epoch, seq, event_id, occurred_at, event_type,
 		        subject_kind, subject_id, task_id, attempt_id, fields
-		   FROM event WHERE scheduler_epoch = ? ORDER BY seq`, int64(epoch))
+		   FROM event WHERE scheduler_epoch = ? AND seq > ? ORDER BY seq LIMIT ?`,
+		int64(epoch), afterSeq, limit)
 	if err != nil {
 		return nil, fmt.Errorf("read events: %w", err)
 	}

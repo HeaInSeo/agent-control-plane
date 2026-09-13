@@ -332,5 +332,14 @@ func (w Workspace) Validate() error {
 	if w.CreatedAt.IsZero() {
 		return fmt.Errorf("%w: created_at is zero", ErrInvalidEntity)
 	}
+	// Absent is fine; present and zero is not — the same rule WorkerAttempt
+	// applies to its optional timestamps.
+	if w.ReleasedAt != nil && w.ReleasedAt.IsZero() {
+		return fmt.Errorf("%w: released_at is present but zero", ErrInvalidEntity)
+	}
+	if w.ReleasedAt != nil && w.ReleasedAt.Before(w.CreatedAt) {
+		return fmt.Errorf("%w: released_at %s precedes created_at %s",
+			ErrInvalidEntity, w.ReleasedAt.UTC(), w.CreatedAt.UTC())
+	}
 	return nil
 }

@@ -436,6 +436,14 @@ detectable in data. Event order identity is `(scheduler_epoch, seq)`, a
 composite primary key, with `seq` allocated by the store inside the appending
 transaction.
 
+History reads page on `(epoch, seq)` rather than an offset, so a page boundary
+cannot shift under a concurrent append: `seq` is monotonic within an epoch and
+history is append-only, so the next page starts exactly where the last ended.
+`EventsInEpoch` reads a whole generation and is bounded by an explicit cap —
+an epoch lasts as long as a scheduler generation and the table can never be
+pruned, so growth surfaces as an error naming `EventsInEpochPage` rather than
+as memory pressure.
+
 ## SQLite backend
 
 WAL, a single connection matching the single-active-scheduler model, and
@@ -453,6 +461,15 @@ integrity checker would otherwise read, and a read-write handle would write, a
 database carrying invariants this build does not know. A partially migrated
 database still opens, since that is one a process may be about to migrate
 forward.
+
+Open runs SQLite's quick integrity check rather than the full one. The full
+check cross-checks every index against its table, so its cost grows with the
+database — and event history is append-only with no prune path, so on a
+long-serving scheduler every restart would pay a full-file scan before the
+epoch could be activated. The quick check still detects a malformed page,
+which is what open-time verification exists to catch; the full check stays
+available as `IntegrityCheck`, for a schedule or an operator tool, and
+`FullIntegrityCheckOnOpen` opts into it.
 
 Everything that inspects the file runs before anything that writes to it.
 `PRAGMA journal_mode = WAL` rewrites the database header and leaves `-wal` and

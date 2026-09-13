@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -308,7 +309,11 @@ func seedAttemptWithoutWorkspace(t *testing.T, db *store.DB, name string) fixtur
 
 	epoch, err := db.CurrentEpoch(ctx)
 	if err != nil {
-		t.Fatalf("current epoch: %v", err)
+		activated, aerr := db.ActivateScheduler(ctx, ids.NewSchedulerOwnerID(), "test activation")
+		if aerr != nil {
+			t.Fatalf("activate scheduler: %v", aerr)
+		}
+		epoch = activated.Epoch
 	}
 
 	f := fixture{Epoch: epoch, Subject: newSubject(name)}
@@ -356,4 +361,27 @@ func seedAttemptWithoutWorkspace(t *testing.T, db *store.DB, name string) fixtur
 		t.Fatalf("seed %s: %v", name, err)
 	}
 	return f
+}
+
+// corruptInterior overwrites the middle of a database file while leaving the
+// SQLite header intact, so the damage has to be caught by an integrity check
+// rather than by the header sniff.
+func corruptInterior(t *testing.T, path string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	garbage := make([]byte, info.Size()/2)
+	for i := range garbage {
+		garbage[i] = 0xBA
+	}
+	if _, err := f.WriteAt(garbage, 4096); err != nil {
+		t.Fatal(err)
+	}
 }

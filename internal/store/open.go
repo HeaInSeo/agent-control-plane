@@ -87,6 +87,18 @@ type Config struct {
 	// SkipIntegrityCheck disables the open-time integrity check. It exists for
 	// tooling that has already verified the file; leave it false.
 	SkipIntegrityCheck bool
+	// FullIntegrityCheckOnOpen runs the complete integrity check rather than
+	// the quick one at open time.
+	//
+	// Open uses PRAGMA quick_check by default. The full check cross-checks
+	// every index against its table, so its cost grows with the database —
+	// and event history is append-only with no prune path, so on a
+	// long-serving scheduler every restart would pay a full-file scan before
+	// the epoch could even be activated. The quick check still detects a
+	// malformed page, which is the failure open-time verification exists to
+	// catch; the full check belongs on a schedule or in an operator tool,
+	// where IntegrityCheck remains available.
+	FullIntegrityCheckOnOpen bool
 }
 
 func (c Config) withDefaults() Config {
@@ -314,7 +326,11 @@ func (db *DB) verifyConnection(ctx context.Context, cfg Config) error {
 		return err
 	}
 	if !cfg.SkipIntegrityCheck {
-		if err := db.IntegrityCheck(ctx); err != nil {
+		check := db.QuickIntegrityCheck
+		if cfg.FullIntegrityCheckOnOpen {
+			check = db.IntegrityCheck
+		}
+		if err := check(ctx); err != nil {
 			return err
 		}
 	}
@@ -380,13 +396,26 @@ func (db *DB) VerifyConnectionPragmas(ctx context.Context) error {
 	return nil
 }
 
-// IntegrityCheck runs SQLite's integrity check and fails closed on any result
-// other than a single "ok".
+// QuickIntegrityCheck runs SQLite's quick integrity check.
+//
+// It verifies page structure without the index-versus-table cross-checks, so
+// its cost does not grow with history the way the full check does. This is
+// what Open uses; IntegrityCheck is the thorough one.
+func (db *DB) QuickIntegrityCheck(ctx context.Context) error {
+	return db.runIntegrityCheck(ctx, "PRAGMA quick_check")
+}
+
+// IntegrityCheck runs SQLite's full integrity check and fails closed on any
+// result other than a single "ok".
 func (db *DB) IntegrityCheck(ctx context.Context) error {
+	return db.runIntegrityCheck(ctx, "PRAGMA integrity_check")
+}
+
+func (db *DB) runIntegrityCheck(ctx context.Context, pragma string) error {
 	if err := db.requireNoOpenTransaction(); err != nil {
 		return err
 	}
-	rows, err := db.sql.QueryContext(ctx, "PRAGMA integrity_check")
+	rows, err := db.sql.QueryContext(ctx, pragma)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrIntegrityCheckFailed, err)
 	}

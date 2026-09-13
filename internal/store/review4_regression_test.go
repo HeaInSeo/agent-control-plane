@@ -321,6 +321,22 @@ func TestWorkspaceIsolationMustMatchIntent(t *testing.T) {
 	err := db.Write(ctx, func(tx *store.Tx) error {
 		return tx.CreateWorkspace(ctx, ws)
 	})
+	// Refused as a typed conflict before it reaches the trigger.
+	if !errors.Is(err, store.ErrWorkspaceConflict) {
+		t.Fatalf("want ErrWorkspaceConflict, got %v", err)
+	}
+
+	// The trigger remains the backstop, proven by bypassing the Go gate.
+	err = db.Write(ctx, func(tx *store.Tx) error {
+		return tx.ExecForTest(ctx,
+			`INSERT INTO workspace (workspace_id, attempt_id, task_id, repository_subject_id,
+			                        base_sha, isolation_kind, root_path, created_at, released_at)
+			 VALUES (?, ?, ?, ?, ?, 'READ_ONLY_CHECKOUT', ?,
+			         '2026-09-12T09:00:00.000000000Z', NULL)`,
+			string(ids.NewWorkspaceID()), string(successor.AttemptID), string(ws.TaskID),
+			string(ws.RepositorySubjectID), string(ws.BaseSHA),
+			"/var/lib/acp/workspaces/r4-isolation-raw")
+	})
 	if err == nil {
 		t.Fatal("a modifying attempt was given a read-only checkout")
 	}
@@ -487,5 +503,55 @@ func TestCompletedTaskStillHoldsModifyingSlot_KnownEscalation(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(err.Error()), "unique") {
 		t.Fatalf("expected the modifying-slot index to reject it, got: %v", err)
+	}
+
+	// The precise shape of the escalation, pinned so the issue's framing
+	// cannot drift: the slot IS recoverable — retiring the completing attempt
+	// frees it — but only by recording a successful attempt as failed,
+	// abandoned or evidence-unknown. So the cost is a false durable record
+	// rather than a permanently wedged repository.
+	if err := db.Write(ctx, func(tx *store.Tx) error {
+		return tx.SetWorkerAttemptStatus(ctx, first.Attempt.AttemptID, state.AttemptAbandoned)
+	}); err != nil {
+		t.Fatalf("retiring the completing attempt should be possible: %v", err)
+	}
+	if err := db.Write(ctx, func(tx *store.Tx) error {
+		return tx.CreateWorkerAttempt(ctx, domain.WorkerAttempt{
+			AttemptID:           ids.NewAttemptID(),
+			TaskID:              secondTask,
+			PacketID:            secondPacket.PacketID,
+			RepositorySubjectID: first.Subject.RepositorySubjectID,
+			Lane:                state.LaneGuardrail,
+			Intent:              state.IntentModifying,
+			SchedulerEpoch:      first.Epoch,
+			FenceEpoch:          1,
+			Status:              state.AttemptClaimed,
+			CreatedAt:           fixedNow,
+			UpdatedAt:           fixedNow,
+		})
+	}); err != nil {
+		t.Fatalf("the slot should be free once the completing attempt is retired: %v", err)
+	}
+
+	// And the falsification is now durable: the attempt that succeeded is on
+	// record as abandoned.
+	if err := db.Read(ctx, func(tx *store.Tx) error {
+		attempt, err := tx.WorkerAttempt(ctx, first.Attempt.AttemptID)
+		if err != nil {
+			return err
+		}
+		if attempt.Status != state.AttemptAbandoned {
+			t.Fatalf("attempt status is %q", string(attempt.Status))
+		}
+		run, err := tx.TaskRun(ctx, first.Task.TaskID)
+		if err != nil {
+			return err
+		}
+		if run.Status != state.TaskCompleted {
+			t.Fatalf("task status is %q, want COMPLETED", string(run.Status))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read: %v", err)
 	}
 }
