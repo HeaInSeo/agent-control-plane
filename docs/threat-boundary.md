@@ -288,8 +288,10 @@ safe reading is that it holds one.
 
 This is defence in depth, not a licence to pass secrets: key-name matching
 cannot catch a credential stored under an innocuous name, one embedded in a
-free-text message, or one sitting as a bare element of a list where there is
-no key to match on.
+free-text message, one sitting as a bare element of a list where there is no
+key to match on, or a short token buried in an unseparated acronym run such as
+`GITHUBPATValue` — splitting that needs a dictionary. Every separated or
+camelCased spelling is covered.
 
 ## Known gaps at M0
 

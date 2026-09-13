@@ -349,6 +349,21 @@ BEGIN
     SELECT RAISE(ABORT, 'current_attempt_id must move forward to a live attempt');
 END;
 
+-- The attempt a task points at must belong to the current generation.
+-- Pointing at a retired generation's attempt wedges the task: it holds the
+-- repository's modifying slot so no replacement can be admitted, while
+-- evidence against it is refused for the stale epoch.
+CREATE TRIGGER trg_task_run_current_attempt_epoch_current
+BEFORE UPDATE OF current_attempt_id ON task_run
+FOR EACH ROW
+WHEN NEW.current_attempt_id IS NOT NULL
+  AND NEW.current_attempt_id IS NOT OLD.current_attempt_id
+  AND (SELECT scheduler_epoch FROM worker_attempt WHERE attempt_id = NEW.current_attempt_id)
+      IS NOT (SELECT current_epoch FROM scheduler_ownership WHERE id = 1)
+BEGIN
+    SELECT RAISE(ABORT, 'current_attempt_id must bind the current scheduler epoch');
+END;
+
 -- Once a task is finished its current attempt is settled. Moving the pointer
 -- afterwards would separate the task from the attempt whose evidence
 -- established completion.
@@ -712,6 +727,16 @@ BEGIN
     SELECT RAISE(ABORT, 'forbidden publish status transition');
 END;
 
+-- A released workspace is not publishable. The Go store enforces this; so
+-- must the schema, on the same premise as the fences around it.
+CREATE TRIGGER trg_publish_attempt_workspace_live
+BEFORE INSERT ON publish_attempt
+FOR EACH ROW
+WHEN (SELECT released_at FROM workspace WHERE workspace_id = NEW.workspace_id) IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'a released workspace cannot publish');
+END;
+
 CREATE TRIGGER trg_publish_attempt_identity_immutable
 BEFORE UPDATE ON publish_attempt
 FOR EACH ROW
@@ -820,6 +845,14 @@ BEGIN
     SELECT RAISE(ABORT, 'evidence published_sha must equal its publish_attempt source_commit_sha');
 END;
 
+CREATE TRIGGER trg_evidence_workspace_live
+BEFORE INSERT ON evidence_observation
+FOR EACH ROW
+WHEN (SELECT released_at FROM workspace WHERE workspace_id = NEW.workspace_id) IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'a released workspace cannot record evidence');
+END;
+
 CREATE TRIGGER trg_evidence_immutable
 BEFORE UPDATE ON evidence_observation
 FOR EACH ROW
@@ -848,8 +881,12 @@ CREATE TABLE event (
     event_type      TEXT NOT NULL CHECK (length(event_type) > 0),
     subject_kind    TEXT NOT NULL CHECK (subject_kind IN ('SCHEDULER', 'REPOSITORY_SUBJECT', 'PACKET', 'TASK_RUN', 'WORKER_ATTEMPT', 'WORKSPACE', 'PUBLISH_ATTEMPT', 'EVIDENCE')),
     subject_id      TEXT NOT NULL CHECK (length(subject_id) > 0),
-    task_id         TEXT,
-    attempt_id      TEXT,
+    -- Foreign keys, like every other identity relation here. AppendEvent
+    -- validates only the shape of these identifiers, so without the
+    -- references a wrong pointer would write a permanently misattributed
+    -- event into a table that rejects UPDATE and DELETE.
+    task_id         TEXT REFERENCES task_run (task_id),
+    attempt_id      TEXT REFERENCES worker_attempt (attempt_id),
     fields          TEXT NOT NULL CHECK (json_valid(fields)),
     PRIMARY KEY (scheduler_epoch, seq)
 ) WITHOUT ROWID;

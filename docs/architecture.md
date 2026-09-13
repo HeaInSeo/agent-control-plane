@@ -141,7 +141,12 @@ fenced-out attempt would sit in the pending queue for ever, resolvable only to
 `REJECTED`.
 
 A publication also records when its status last moved, and each transition
-appends an event. `task_run` carries `updated_at` and `workspace` carries
+appends an event. Re-asserting the status a publication already has is a
+no-op: both the crash-recovery flow and a periodic reconciler re-assert, and
+treating that as a move would rewrite `updated_at` — which means "when the
+status last moved" — and append a phantom transition per cycle to a table
+nothing can prune. A `PENDING` intent has by definition never moved, so its
+`updated_at` always equals its `created_at`. `task_run` carries `updated_at` and `workspace` carries
 `released_at`, so without this the most irreversible entity would have been
 the one recording nothing about when it changed — precisely what a publisher
 resuming after a crash needs. Comprehensive per-mutation history for the other

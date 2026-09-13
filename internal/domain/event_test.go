@@ -279,3 +279,38 @@ func TestRedactionIsSeparatorInsensitive(t *testing.T) {
 		}
 	}
 }
+
+// Noted by the twelfth review: an acronym run hid a short sensitive token,
+// because the tokenizer split only lower-to-upper boundaries.
+func TestRedactionSplitsAcronymBoundaries(t *testing.T) {
+	mustRedact := []string{
+		"PATValue", "PATToken", "myPATValue",
+		"APIKeyValue", "SSHKeyPath", "JWTToken", "OTPCode",
+	}
+	for _, key := range mustRedact {
+		out := domain.RedactFields(map[string]any{key: "fake-not-a-real-secret"})
+		if out[key] != domain.Redacted {
+			t.Fatalf("sensitive field %q survived as %v", key, out[key])
+		}
+	}
+
+	// The remaining limit, stated rather than pretended away: two acronyms
+	// concatenated with no separator ("GITHUBPATValue") cannot be split
+	// without a dictionary, so a short token hidden inside one is not
+	// matched. Every separated or camelCased spelling is.
+	if domain.RedactFields(map[string]any{"GITHUBPATValue": "x"})["GITHUBPATValue"] == domain.Redacted {
+		t.Fatal("unseparated acronym runs are now split; update this documented limit")
+	}
+
+	// Acronym splitting must not create new false positives.
+	mustSurvive := []string{
+		"HTTPStatus", "URLPath", "IDValue", "XMLName",
+		"JSONPayload", "UUIDValue", "CPUCount",
+	}
+	for _, key := range mustSurvive {
+		out := domain.RedactFields(map[string]any{key: "keep-me"})
+		if out[key] != "keep-me" {
+			t.Fatalf("ordinary field %q was destroyed", key)
+		}
+	}
+}

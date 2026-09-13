@@ -275,6 +275,13 @@ func keyWords(key string) []string {
 			// lower-to-upper transition: githubPat -> github, Pat
 			flush()
 			current = append(current, r)
+		case unicode.IsUpper(r) && i > 0 && unicode.IsUpper(runes[i-1]) &&
+			i+1 < len(runes) && unicode.IsLower(runes[i+1]):
+			// end of an acronym run: PATValue -> PAT, Value. Without this the
+			// whole name is one word and a short sensitive token inside an
+			// acronym escapes the word match.
+			flush()
+			current = append(current, r)
 		default:
 			current = append(current, r)
 		}

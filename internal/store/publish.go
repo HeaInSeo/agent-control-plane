@@ -62,9 +62,11 @@ func (t *Tx) RecordPublishAttempt(ctx context.Context, p domain.PublishAttempt) 
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = t.Now()
 	}
-	if p.UpdatedAt.IsZero() {
-		p.UpdatedAt = p.CreatedAt
-	}
+	// Not merely defaulted: the status is pinned to PENDING two lines above,
+	// so the intent has by definition never moved. A caller populating both
+	// timestamps from separate clock reads would otherwise record "the status
+	// moved at T2" for a status that never moved.
+	p.UpdatedAt = p.CreatedAt
 	if err := p.Validate(); err != nil {
 		return err
 	}
@@ -297,6 +299,15 @@ func (t *Tx) SetPublishStatus(ctx context.Context, id ids.PublishAttemptID, stat
 	if !current.Status.CanTransitionTo(status) {
 		return fmt.Errorf("%w: publication %s cannot move from %q to %q",
 			ErrForbiddenPublishTransition, string(id), string(current.Status), string(status))
+	}
+	// Re-asserting the current status is a no-op, not a move. Both the
+	// documented recovery flow (resolve an intent by idempotency key, then
+	// re-assert the outcome already recorded) and a periodic reconciler
+	// re-asserting OBSERVED reach this, and treating it as a move would
+	// rewrite updated_at — which means "when the status last moved" — and
+	// append one phantom transition per cycle to a table nothing can prune.
+	if status == current.Status {
+		return nil
 	}
 	now := t.Now()
 	if err := t.exactlyOne(ctx, "publish attempt", string(id),
