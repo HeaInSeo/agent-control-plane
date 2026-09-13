@@ -67,6 +67,18 @@ func (s SchedulerEpoch) Validate() error {
 	if s.ActivationReason == "" {
 		return fmt.Errorf("%w: activation_reason is empty", ErrInvalidEntity)
 	}
+	// Absent is fine; present and zero is not, and a release cannot precede
+	// the activation it ends — the same rules the other optional timestamps
+	// in this package carry.
+	if s.ReleasedAt != nil {
+		if s.ReleasedAt.IsZero() {
+			return fmt.Errorf("%w: released_at is present but zero", ErrInvalidEntity)
+		}
+		if s.ReleasedAt.Before(s.ActivatedAt) {
+			return fmt.Errorf("%w: released_at %s precedes activated_at %s",
+				ErrInvalidEntity, s.ReleasedAt.UTC(), s.ActivatedAt.UTC())
+		}
+	}
 	return nil
 }
 

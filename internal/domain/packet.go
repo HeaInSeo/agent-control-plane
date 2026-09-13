@@ -123,6 +123,15 @@ func (p ExecutionPacket) Validate() error {
 			return fmt.Errorf("%w: %q is both allowed and forbidden", ErrPacketInvalid, f)
 		}
 	}
+	// Checked like the scope lists. An approved packet is immutable and
+	// undeletable, so an empty stop condition would be a permanent condition
+	// matching nothing — and the schema calls a removed stop condition a
+	// change of authority.
+	for i, c := range p.StopConditions {
+		if c == "" {
+			return fmt.Errorf("%w: stop_conditions[%d] is empty", ErrPacketInvalid, i)
+		}
+	}
 	if p.AcceptanceContract == "" {
 		return fmt.Errorf("%w: acceptance_contract is empty", ErrPacketInvalid)
 	}

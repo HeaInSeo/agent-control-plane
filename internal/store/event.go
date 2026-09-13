@@ -58,6 +58,10 @@ func (t *Tx) AppendEvent(ctx context.Context, e domain.Event) (int64, error) {
 		e.EventType, string(e.SubjectKind), e.SubjectID,
 		taskIDArg(e.TaskID), attemptIDArg(e.AttemptID), fields,
 	); err != nil {
+		if isUniqueViolationOn(err, "event.event_id") {
+			return 0, fmt.Errorf("%w: event_id %s is already recorded: %w",
+				ErrDuplicateEventIdentity, string(e.EventID), err)
+		}
 		return 0, fmt.Errorf("append event: %w", err)
 	}
 	return seq, nil
@@ -189,6 +193,15 @@ func isUniqueViolation(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "unique constraint failed") ||
 		strings.Contains(msg, "constraint failed: unique")
+}
+
+// isTriggerAbort reports whether err carries a RAISE(ABORT) message.
+//
+// The schema expresses several invariants as BEFORE INSERT triggers, which
+// abort before any table constraint is evaluated, so matching on the trigger's
+// own message is the only way to give those refusals a typed error.
+func isTriggerAbort(err error, message string) bool {
+	return err != nil && strings.Contains(err.Error(), message)
 }
 
 // isUniqueViolationOn reports whether err is a uniqueness failure naming all

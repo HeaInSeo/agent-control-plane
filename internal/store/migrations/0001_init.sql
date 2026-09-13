@@ -24,7 +24,13 @@ CREATE TABLE scheduler_epoch (
     owner_id          TEXT NOT NULL CHECK (length(owner_id) > 0),
     activated_at      TEXT NOT NULL CHECK (length(activated_at) > 0),
     activation_reason TEXT NOT NULL CHECK (length(activation_reason) > 0),
-    released_at       TEXT
+    released_at       TEXT,
+
+    -- The same guard workspace.released_at carries. Nothing writes this
+    -- column yet, which is the point: scheduler_epoch rejects DELETE, so the
+    -- first writer must not be able to store a zero value or one preceding
+    -- activation into a row that can never be corrected.
+    CHECK (released_at IS NULL OR released_at >= activated_at)
 );
 
 -- Current ownership is a singleton row. current_epoch may only move forward:
@@ -353,6 +359,21 @@ WHEN NEW.current_attempt_id IS NOT NULL
   )
 BEGIN
     SELECT RAISE(ABORT, 'current_attempt_id must move forward to a live attempt');
+END;
+
+-- Nor may it be cleared. The forward-only rule above fires only when the new
+-- value is non-NULL, so a NULL round-trip would launder the pointer backwards
+-- onto a fenced-out attempt — and completion is expressed as "the evidence
+-- came from the task's current attempt", which is the guarantee that rule
+-- exists to protect. No Go path clears it; the schema must not allow it
+-- either.
+CREATE TRIGGER trg_task_run_current_attempt_not_cleared
+BEFORE UPDATE OF current_attempt_id ON task_run
+FOR EACH ROW
+WHEN OLD.current_attempt_id IS NOT NULL
+ AND NEW.current_attempt_id IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'current_attempt_id cannot be cleared once set');
 END;
 
 -- The attempt a task points at must belong to the current generation.

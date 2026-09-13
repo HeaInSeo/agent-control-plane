@@ -385,3 +385,66 @@ func corruptInterior(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 }
+
+// seedAttemptUnpointed builds a read-only task on its own repository subject
+// with a live attempt, leaving the task's current-attempt pointer unset.
+//
+// Useful where a test needs to exercise the first write of that pointer:
+// clearing it once set is forbidden by the schema, so a test cannot simply
+// reset a pointed task.
+func seedAttemptUnpointed(t *testing.T, db *store.DB, name string) fixture {
+	t.Helper()
+	ctx := context.Background()
+
+	epoch, err := db.CurrentEpoch(ctx)
+	if err != nil {
+		activated, aerr := db.ActivateScheduler(ctx, ids.NewSchedulerOwnerID(), "test activation")
+		if aerr != nil {
+			t.Fatalf("activate scheduler: %v", aerr)
+		}
+		epoch = activated.Epoch
+	}
+
+	f := fixture{Epoch: epoch, Subject: newSubject(name)}
+	taskID := ids.NewTaskID()
+	f.Packet = newPacket(taskID, f.Subject.RepositorySubjectID, state.IntentReadOnly, state.LaneReview)
+	f.Task = domain.TaskRun{
+		TaskID:              taskID,
+		RepositorySubjectID: f.Subject.RepositorySubjectID,
+		PacketID:            f.Packet.PacketID,
+		Lane:                state.LaneReview,
+		Intent:              state.IntentReadOnly,
+		Status:              state.TaskReady,
+		CreatedAt:           fixedNow,
+		UpdatedAt:           fixedNow,
+	}
+	f.Attempt = domain.WorkerAttempt{
+		AttemptID:           ids.NewAttemptID(),
+		TaskID:              taskID,
+		PacketID:            f.Packet.PacketID,
+		RepositorySubjectID: f.Subject.RepositorySubjectID,
+		Lane:                state.LaneReview,
+		Intent:              state.IntentReadOnly,
+		SchedulerEpoch:      epoch,
+		FenceEpoch:          1,
+		Status:              state.AttemptRunning,
+		CreatedAt:           fixedNow,
+		UpdatedAt:           fixedNow,
+	}
+
+	if err := db.Write(ctx, func(tx *store.Tx) error {
+		if _, err := tx.ObserveRepositorySubject(ctx, f.Subject); err != nil {
+			return err
+		}
+		if err := tx.ApprovePacket(ctx, f.Packet); err != nil {
+			return err
+		}
+		if err := tx.CreateTaskRun(ctx, f.Task); err != nil {
+			return err
+		}
+		return tx.CreateWorkerAttempt(ctx, f.Attempt)
+	}); err != nil {
+		t.Fatalf("seed %s: %v", name, err)
+	}
+	return f
+}

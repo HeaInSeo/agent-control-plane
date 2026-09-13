@@ -143,7 +143,11 @@ fenced-out attempt would sit in the pending queue for ever, resolvable only to
 
 Every timestamp that records "when this row last changed" is written
 monotonically, clamped to what the row already holds, and the ordering is a
-schema `CHECK` as well. A backward clock step — an NTP correction, a VM
+schema `CHECK` as well. Timestamps are defaulted before validation, not after,
+so the ordering check sees real values — validating first let a
+caller-supplied `created_at` pair with a store-supplied `updated_at` that
+preceded it, and the refusal arrived as a raw driver error rather than a typed
+one. A backward clock step — an NTP correction, a VM
 resume — would otherwise store a row claiming it changed before it existed,
 and since these rows are immutable or undeletable that claim could never be
 corrected. Clamping loses a little precision on a clock glitch and keeps the
@@ -191,6 +195,12 @@ worktree is not in the set, because worktrees share Git metadata with a process
 that can run arbitrary local Git. The schema holds one workspace per attempt
 (`UNIQUE(attempt_id)`), one attempt per directory (`UNIQUE(root_path)`), and an
 immutable owner, so a workspace cannot be shared or rebound.
+
+A task's `current_attempt_id` cannot be cleared once set, not only moved
+forward. The forward-only rule fires only when the new value is non-NULL, so a
+NULL round-trip would otherwise launder the pointer backwards onto a
+fenced-out attempt — and completion is expressed as "the evidence came from
+the task's current attempt", which is the guarantee that rule protects.
 
 `root_path` must be absolute and already canonical. Uniqueness of a string is
 not uniqueness of a directory: `/a/ws`, `/a/ws/`, `/a/./ws`, `/a/b/../ws` and a
@@ -508,6 +518,13 @@ The handle-level queries — `SchemaVersion`, `VerifySchema`,
 carry the same guard. They go straight to the pool rather than through a
 transaction, so without it they would reach the identical hang by a different
 door.
+
+`Mode` is a bounded set and validates like every other one here. An
+out-of-range value used to fail open in the worst direction: the DSN took the
+read-write branch, the write guards passed, but `enableWAL` returned early
+because the mode was not exactly `ModeReadWrite` — so the handle wrote durable
+state in rollback-journal mode, silently voiding the WAL and
+`synchronous = FULL` durability story.
 
 `Read` runs a genuinely read-only transaction: the driver treats
 `sql.TxOptions.ReadOnly` as a hint about which `BEGIN` to issue and enforces

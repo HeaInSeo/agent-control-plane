@@ -239,19 +239,13 @@ func TestGoOnlyInvariantsAreAlsoEnforcedBySchema(t *testing.T) {
 
 	t.Run("current attempt must bind the current epoch", func(t *testing.T) {
 		db := newDB(t)
-		f := seed(t, db, "r12-epoch-ptr", state.IntentModifying, state.LaneOperator)
+		// A task whose pointer was never set: clearing one is forbidden, so
+		// the first write is the only way to exercise this trigger.
+		f := seedAttemptUnpointed(t, db, "r12-epoch-ptr")
 		if _, err := db.ActivateScheduler(ctx, ids.NewSchedulerOwnerID(), "successor"); err != nil {
 			t.Fatalf("activate: %v", err)
 		}
 		err := db.Write(ctx, func(tx *store.Tx) error {
-			return tx.ExecForTest(ctx,
-				`UPDATE task_run SET current_attempt_id = NULL WHERE task_id = ?`,
-				string(f.Task.TaskID))
-		})
-		if err != nil {
-			t.Fatalf("clear pointer: %v", err)
-		}
-		err = db.Write(ctx, func(tx *store.Tx) error {
 			return tx.ExecForTest(ctx,
 				`UPDATE task_run SET current_attempt_id = ? WHERE task_id = ?`,
 				string(f.Attempt.AttemptID), string(f.Task.TaskID))

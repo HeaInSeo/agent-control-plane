@@ -77,6 +77,18 @@ func (t *Tx) CreateTaskRun(ctx context.Context, run domain.TaskRun) error {
 	if err := t.RequireOwnership(ctx); err != nil {
 		return err
 	}
+	// Default before validating, so the ordering check sees real values. The
+	// validator skips the comparison when either timestamp is zero, so
+	// validating first let a caller-supplied created_at pair with a
+	// store-supplied updated_at that precedes it — surfacing as a raw CHECK
+	// failure from the driver instead of a typed refusal.
+	now := t.Now()
+	if run.CreatedAt.IsZero() {
+		run.CreatedAt = now
+	}
+	if run.UpdatedAt.IsZero() {
+		run.UpdatedAt = run.CreatedAt
+	}
 	if err := run.Validate(); err != nil {
 		return err
 	}
@@ -102,13 +114,6 @@ func (t *Tx) CreateTaskRun(ctx context.Context, run domain.TaskRun) error {
 	// admit an attempt, never complete, and only ever be abandoned.
 	if err := t.requirePacketAuthority(ctx, run.PacketID); err != nil {
 		return err
-	}
-	now := t.Now()
-	if run.CreatedAt.IsZero() {
-		run.CreatedAt = now
-	}
-	if run.UpdatedAt.IsZero() {
-		run.UpdatedAt = now
 	}
 	if _, err := t.exec(ctx,
 		`INSERT INTO task_run (task_id, repository_subject_id, packet_id, lane, intent,
@@ -410,6 +415,13 @@ func (t *Tx) CreateWorkerAttempt(ctx context.Context, a domain.WorkerAttempt) er
 	if err := t.RequireOwnership(ctx); err != nil {
 		return err
 	}
+	now := t.Now()
+	if a.CreatedAt.IsZero() {
+		a.CreatedAt = now
+	}
+	if a.UpdatedAt.IsZero() {
+		a.UpdatedAt = a.CreatedAt
+	}
 	if err := a.Validate(); err != nil {
 		return err
 	}
@@ -446,13 +458,6 @@ func (t *Tx) CreateWorkerAttempt(ctx context.Context, a domain.WorkerAttempt) er
 		return fmt.Errorf("%w: packet %s expired at %s",
 			domain.ErrPacketExpired, string(a.PacketID), packet.ExpiresAt.UTC())
 	}
-	now := t.Now()
-	if a.CreatedAt.IsZero() {
-		a.CreatedAt = now
-	}
-	if a.UpdatedAt.IsZero() {
-		a.UpdatedAt = now
-	}
 	if _, err := t.exec(ctx,
 		`INSERT INTO worker_attempt (attempt_id, task_id, packet_id, repository_subject_id,
 		                             lane, intent, scheduler_epoch, fence_epoch, status,
@@ -467,7 +472,12 @@ func (t *Tx) CreateWorkerAttempt(ctx context.Context, a domain.WorkerAttempt) er
 			return fmt.Errorf("%w: repository subject %s (lane-agnostic): %w",
 				ErrModifyingSlotBusy, string(a.RepositorySubjectID), err)
 		}
-		if isUniqueViolationOn(err, "worker_attempt.task_id", "worker_attempt.fence_epoch") {
+		// The monotonic trigger is BEFORE INSERT, so it aborts before the
+		// UNIQUE(task_id, fence_epoch) constraint is ever evaluated — a
+		// uniqueness match here could never fire. Match what actually
+		// happens instead, so a reused fencing token is a typed refusal.
+		if isTriggerAbort(err, "fence_epoch must be monotonic") ||
+			isUniqueViolationOn(err, "worker_attempt.task_id", "worker_attempt.fence_epoch") {
 			return fmt.Errorf("%w: fence epoch %d already issued for task %s: %w",
 				ErrInvalidTaskRun, int64(a.FenceEpoch), string(a.TaskID), err)
 		}

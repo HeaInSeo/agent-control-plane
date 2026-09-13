@@ -58,6 +58,22 @@ const (
 	ModeReadOnly
 )
 
+// Validate reports whether the mode is one of the defined access modes.
+//
+// An out-of-range value used to fail open in the worst direction: dsn took
+// the read-write branch (no mode=ro, no query_only) and the write guards
+// passed, while enableWAL returned early because the mode was not exactly
+// ModeReadWrite — so the handle wrote durable state in rollback-journal mode,
+// silently voiding the WAL and synchronous=FULL durability story.
+func (m Mode) Validate() error {
+	switch m {
+	case ModeReadWrite, ModeReadOnly:
+		return nil
+	default:
+		return fmt.Errorf("store: %s is not a defined access mode", m)
+	}
+}
+
 // String implements fmt.Stringer.
 func (m Mode) String() string {
 	switch m {
@@ -112,6 +128,9 @@ func (c Config) withDefaults() Config {
 func (c Config) validate() error {
 	if c.Path == "" {
 		return errors.New("store: Config.Path is required")
+	}
+	if err := c.Mode.Validate(); err != nil {
+		return err
 	}
 	// SQLite's busy_timeout is in milliseconds, so a sub-millisecond value
 	// truncates to zero — which means "do not wait at all", the opposite of
