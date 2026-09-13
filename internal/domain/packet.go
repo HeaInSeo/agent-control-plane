@@ -169,6 +169,12 @@ func (p ExecutionPacket) Authorize(now time.Time, observed SourceBinding) error 
 	if !p.Status.GrantsExecutionAuthority() {
 		return fmt.Errorf("%w: status is %q", ErrPacketNoAuthority, string(p.Status))
 	}
+	// A zero clock is before every real expiry, so without this an unset time
+	// would silently skip the expiry check in the primary launch and resume
+	// gate. CheckPublishPreconditions guards the identical hazard.
+	if now.IsZero() {
+		return fmt.Errorf("%w: authorization time is unset", ErrPacketInvalid)
+	}
 	if !now.Before(p.ExpiresAt) {
 		return fmt.Errorf("%w: expired at %s, now %s", ErrPacketExpired, p.ExpiresAt.UTC(), now.UTC())
 	}

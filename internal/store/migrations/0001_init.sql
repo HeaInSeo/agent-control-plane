@@ -544,6 +544,18 @@ END;
 -- freely. Without this a MODIFYING attempt could own a READ_ONLY_CHECKOUT and
 -- still publish from it: the publish coherence trigger checks the attempt's
 -- intent, the workspace's owner and its base SHA, but not its isolation.
+-- A finished task takes on no new durable state. The Go store enforces this,
+-- but so must the schema: this file's premise is that a future code path
+-- cannot bypass an invariant by forgetting a check, and withdrawal leaves the
+-- attempt live, so nothing else downstream notices.
+CREATE TRIGGER trg_workspace_task_not_terminal
+BEFORE INSERT ON workspace
+FOR EACH ROW
+WHEN (SELECT status FROM task_run WHERE task_id = NEW.task_id) IN ('COMPLETED', 'ABANDONED')
+BEGIN
+    SELECT RAISE(ABORT, 'a terminal task cannot take a new workspace');
+END;
+
 CREATE TRIGGER trg_workspace_isolation_matches_intent
 BEFORE INSERT ON workspace
 FOR EACH ROW
@@ -642,6 +654,17 @@ END;
 -- Every identity field must agree with the attempt and the workspace. A stale
 -- or foreign attempt therefore cannot borrow another attempt's publication
 -- identity or another workspace's commit metadata.
+-- Publication is the irreversible step, so the task-liveness fence matters
+-- most here: a cancelled task whose push still went out is the worst outcome
+-- this control plane can produce.
+CREATE TRIGGER trg_publish_attempt_task_not_terminal
+BEFORE INSERT ON publish_attempt
+FOR EACH ROW
+WHEN (SELECT status FROM task_run WHERE task_id = NEW.task_id) IN ('COMPLETED', 'ABANDONED')
+BEGIN
+    SELECT RAISE(ABORT, 'a terminal task cannot publish');
+END;
+
 CREATE TRIGGER trg_publish_attempt_binding_coherence
 BEFORE INSERT ON publish_attempt
 FOR EACH ROW
@@ -757,6 +780,16 @@ CREATE TABLE evidence_observation (
 CREATE INDEX ix_evidence_attempt ON evidence_observation (attempt_id);
 
 -- Evidence must be about the attempt it names, in every identity dimension.
+-- An observation filed against a finished task is permanent state belonging
+-- to work that is over: immutable, undeletable, and rejected by completion.
+CREATE TRIGGER trg_evidence_task_not_terminal
+BEFORE INSERT ON evidence_observation
+FOR EACH ROW
+WHEN (SELECT status FROM task_run WHERE task_id = NEW.task_id) IN ('COMPLETED', 'ABANDONED')
+BEGIN
+    SELECT RAISE(ABORT, 'a terminal task cannot record evidence');
+END;
+
 CREATE TRIGGER trg_evidence_attribution_coherence
 BEFORE INSERT ON evidence_observation
 FOR EACH ROW

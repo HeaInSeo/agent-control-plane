@@ -167,7 +167,7 @@ func (db *DB) Write(ctx context.Context, fn func(*Tx) error) error {
 	if db.mode == ModeReadOnly {
 		return fmt.Errorf("%w: cannot start a write transaction", ErrReadOnly)
 	}
-	return db.runTx(ctx, false, fn)
+	return db.runTx(ctx, false, fn, nil)
 }
 
 // Read runs fn inside a read-only transaction.
@@ -185,10 +185,14 @@ func (db *DB) Write(ctx context.Context, fn func(*Tx) error) error {
 // while the transaction still holds that connection, and getting the ordering
 // wrong deadlocks or — worse — leaves the handle read-only for good.
 func (db *DB) Read(ctx context.Context, fn func(*Tx) error) error {
-	return db.runTx(ctx, true, fn)
+	return db.runTx(ctx, true, fn, nil)
 }
 
-func (db *DB) runTx(ctx context.Context, readOnly bool, fn func(*Tx) error) (err error) {
+// runTx runs fn in a transaction. afterCommit, when non-nil, runs after a
+// successful commit and before the transaction lock is released, so a caller
+// that has to publish state derived from the commit can make it visible
+// before the next transaction is allowed to observe it.
+func (db *DB) runTx(ctx context.Context, readOnly bool, fn func(*Tx) error, afterCommit func()) (err error) {
 	// Concurrency and nesting need opposite answers, so they are told apart
 	// before taking the lock. A second goroutine should wait its turn — the
 	// store has one connection, so transactions serialise. The goroutine that
@@ -230,6 +234,9 @@ func (db *DB) runTx(ctx context.Context, readOnly bool, fn func(*Tx) error) (err
 		return fmt.Errorf("store: commit: %w", err)
 	}
 	committed = true
+	if afterCommit != nil {
+		afterCommit()
+	}
 	return nil
 }
 
@@ -256,7 +263,24 @@ func (db *DB) ActivateScheduler(ctx context.Context, owner ids.SchedulerOwnerID,
 	activating.assumeOwnership = true
 
 	var activated domain.SchedulerEpoch
-	err := activating.Write(ctx, func(tx *Tx) error {
+	// Ownership is published after the commit but before the transaction lock
+	// is released. Publishing it after the lock would leave a window in which
+	// a goroutine waiting on that lock starts its transaction, snapshots an
+	// ownership that activation has already superseded, and is refused as
+	// unowned or stale — an error indistinguishable from a real fencing
+	// refusal, so the caller could not safely retry.
+	publishOwnership := func() {
+		for {
+			current := db.ownerEpoch.Load()
+			if current >= int64(activated.Epoch) {
+				return
+			}
+			if db.ownerEpoch.CompareAndSwap(current, int64(activated.Epoch)) {
+				return
+			}
+		}
+	}
+	err := activating.runTx(ctx, false, func(tx *Tx) error {
 		var current int64
 		err := tx.tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(epoch), 0) FROM scheduler_epoch`).Scan(&current)
 		if err != nil {
@@ -303,23 +327,9 @@ func (db *DB) ActivateScheduler(ctx context.Context, owner ids.SchedulerOwnerID,
 
 		activated = next
 		return nil
-	})
+	}, publishOwnership)
 	if err != nil {
 		return domain.SchedulerEpoch{}, err
-	}
-	// Ownership is recorded only after the activation transaction committed,
-	// and only ever upward. Two activations serialise inside the transaction
-	// but land here unordered, so a plain Store could leave the handle
-	// believing it owns an older generation than it does — and every
-	// subsequent write would fail as stale until the process restarted.
-	for {
-		current := db.ownerEpoch.Load()
-		if current >= int64(activated.Epoch) {
-			break
-		}
-		if db.ownerEpoch.CompareAndSwap(current, int64(activated.Epoch)) {
-			break
-		}
 	}
 	return activated, nil
 }

@@ -318,3 +318,46 @@ func TestTargetRefFollowsGitCheckRefFormat(t *testing.T) {
 		}
 	}
 }
+
+// Finding 10.3: a zero clock is before every real expiry, so an unset time
+// would silently skip the expiry check in the primary launch/resume gate.
+func TestAuthorizeRejectsAnUnsetClock(t *testing.T) {
+	p := validPacket()
+	binding := domain.SourceBinding{Revision: p.SourceRevision, Digest: p.SourceDigest}
+
+	if err := p.Authorize(time.Time{}, binding); !errors.Is(err, domain.ErrPacketInvalid) {
+		t.Fatalf("want ErrPacketInvalid for an unset clock, got %v", err)
+	}
+	if err := p.Authorize(now, binding); err != nil {
+		t.Fatalf("a real clock was rejected: %v", err)
+	}
+}
+
+// Finding 10.6: "/" and "/etc" are absolute and canonical, and neither is a
+// workspace. The allocator materialises and later releases these trees, and
+// UNIQUE(root_path) burns whatever is recorded for good.
+func TestWorkspaceRootMustNotBeShallow(t *testing.T) {
+	base := domain.Workspace{
+		WorkspaceID:         ids.NewWorkspaceID(),
+		AttemptID:           ids.NewAttemptID(),
+		TaskID:              ids.NewTaskID(),
+		RepositorySubjectID: ids.NewRepositorySubjectID(),
+		BaseSHA:             domain.CommitSHA("829777a860de1f3c4a2a3f6d19d7919ca52a7c89"),
+		IsolationKind:       domain.IsolationIsolatedClone,
+		CreatedAt:           now,
+	}
+	for _, shallow := range []string{"/", "/etc", "/tmp", "/srv"} {
+		ws := base
+		ws.RootPath = shallow
+		if err := ws.Validate(); !errors.Is(err, domain.ErrInvalidEntity) {
+			t.Fatalf("root_path %q was accepted", shallow)
+		}
+	}
+	for _, ok := range []string{"/tmp/ws-1", "/var/lib/acp/workspaces/attempt-17"} {
+		ws := base
+		ws.RootPath = ok
+		if err := ws.Validate(); err != nil {
+			t.Fatalf("root_path %q was rejected: %v", ok, err)
+		}
+	}
+}

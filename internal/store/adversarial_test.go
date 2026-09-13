@@ -251,6 +251,26 @@ func TestForeignOrStaleAttemptCannotReusePublishIdentity(t *testing.T) {
 		err := db.Write(ctx, func(tx *store.Tx) error {
 			return tx.RecordPublishAttempt(ctx, thief)
 		})
+		// Refused as a typed binding error before it reaches the trigger.
+		if !errors.Is(err, domain.ErrPublishBindingInvalid) {
+			t.Fatalf("want ErrPublishBindingInvalid, got %v", err)
+		}
+
+		// The trigger is still the backstop, proven by bypassing the Go gate.
+		err = db.Write(ctx, func(tx *store.Tx) error {
+			return tx.ExecForTest(ctx,
+				`INSERT INTO publish_attempt (publish_attempt_id, task_id, attempt_id,
+				                              scheduler_epoch, fence_epoch, workspace_id,
+				                              repository_subject_id, base_sha, source_commit_sha,
+				                              target_ref, idempotency_key, status, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING',
+				         '2026-09-12T09:00:00.000000000Z')`,
+				string(ids.NewPublishAttemptID()), string(other.Task.TaskID),
+				string(other.Attempt.AttemptID), int64(other.Attempt.SchedulerEpoch),
+				int64(other.Attempt.FenceEpoch), string(f.Workspace.WorkspaceID),
+				string(other.Subject.RepositorySubjectID), string(other.Workspace.BaseSHA),
+				string(commit), "refs/heads/m0/stolen-raw", "raw-key-"+string(commit))
+		})
 		if err == nil {
 			t.Fatal("publication from a foreign workspace was accepted")
 		}

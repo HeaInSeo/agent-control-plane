@@ -116,6 +116,11 @@ the same liveness fence as completion, on both the attempt and the task: a
 terminal attempt, a released workspace or a finished task cannot be given a
 workspace, mint a publication, or have an observation filed against it.
 
+All three fences are enforced in the schema as well as in Go — a
+`BEFORE INSERT` trigger on `workspace`, `publish_attempt` and
+`evidence_observation` — because this file's premise is that a future code
+path cannot bypass an invariant by forgetting a check.
+
 The task half matters most for publication. Withdrawing a task leaves its
 attempt live — the current-attempt pointer is frozen when a task goes terminal
 — so nothing else in the chain notices, and publication is the irreversible
@@ -167,6 +172,14 @@ immutable owner, so a workspace cannot be shared or rebound.
 not uniqueness of a directory: `/a/ws`, `/a/ws/`, `/a/./ws`, `/a/b/../ws` and a
 relative `ws` are five distinct strings naming at most one directory, so
 without canonicalisation the constraint would not mean what it says.
+
+The path must also be deeper than a top-level directory: `/` and `/etc` are
+absolute and canonical, and neither is a workspace. Since the allocator
+materialises and later releases these trees and `UNIQUE(root_path)` burns
+whatever is recorded, a mis-computed root must not be storable. That is a
+blast-radius guard rather than a security boundary — it bounds the damage of a
+mistake, it does not stop a determined caller naming a bad directory two
+levels down.
 
 Symlinks are not covered, and the distinction is worth stating plainly rather
 than claiming more than holds: `/srv/ws-a/t1` and `/srv/ws-b/t1` are both

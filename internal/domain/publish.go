@@ -267,6 +267,13 @@ func CheckPublishPreconditions(p PublishAttempt, live PublishPreconditions) erro
 		return fmt.Errorf("%w: attempt fence epoch is %d, publish is bound to %d",
 			ErrPublishBindingInvalid, int64(live.AttemptFenceEpoch), int64(p.FenceEpoch))
 	}
+	// Validated, not just inspected: "".IsTerminal() is false, so an unset or
+	// unrecognised status would sail through the one check meant to catch a
+	// dead attempt. Every other field in this struct already fails closed on
+	// its zero value, and TaskStatus was added with exactly this guard.
+	if err := live.AttemptStatus.Validate(); err != nil {
+		return fmt.Errorf("%w: %w", ErrPublishBindingInvalid, err)
+	}
 	if live.AttemptStatus.IsTerminal() {
 		return fmt.Errorf("%w: attempt %s is terminal (%s)",
 			ErrPublishBindingInvalid, string(p.AttemptID), string(live.AttemptStatus))

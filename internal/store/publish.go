@@ -89,6 +89,18 @@ func (t *Tx) RecordPublishAttempt(ctx context.Context, p domain.PublishAttempt) 
 		return fmt.Errorf("%w: workspace %s is released",
 			domain.ErrPublishBindingInvalid, string(p.WorkspaceID))
 	}
+	// Checked here as well as by trigger, so a mis-wired publication is a
+	// typed refusal rather than a raw constraint failure a caller cannot tell
+	// apart from a corrupt database.
+	if workspace.AttemptID != p.AttemptID {
+		return fmt.Errorf("%w: workspace %s belongs to attempt %s, not %s",
+			domain.ErrPublishBindingInvalid, string(p.WorkspaceID),
+			string(workspace.AttemptID), string(p.AttemptID))
+	}
+	if attempt.Intent != state.IntentModifying {
+		return fmt.Errorf("%w: attempt %s is %s and publishes nothing",
+			domain.ErrPublishBindingInvalid, string(p.AttemptID), string(attempt.Intent))
+	}
 	// Publication is the third moment packet authority has to hold, alongside
 	// admission and launch/resume. Recording an intent mints durable,
 	// authority-bearing state that is undeletable and immutable except for

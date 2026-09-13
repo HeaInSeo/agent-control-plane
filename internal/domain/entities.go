@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/HeaInSeo/agent-control-plane/internal/ids"
@@ -259,6 +260,16 @@ func validateWorkspacePath(path string) error {
 	}
 	if cleaned := filepath.Clean(path); cleaned != path {
 		return fmt.Errorf("%w: root_path %q is not canonical (want %q)", ErrInvalidEntity, path, cleaned)
+	}
+	// "/" and "/etc" are absolute and canonical, and neither is a workspace.
+	// The allocator materialises and later releases these trees, and
+	// UNIQUE(root_path) burns whatever is recorded for good, so a
+	// mis-computed root — an empty join producing "/", or a config default —
+	// must not be storable. This is a blast-radius guard, not a security
+	// boundary: it bounds the damage of a mistake, it does not stop a
+	// determined caller from naming a bad directory two levels down.
+	if depth := len(strings.Split(strings.Trim(path, "/"), "/")); depth < 2 {
+		return fmt.Errorf("%w: root_path %q is too shallow to be a workspace", ErrInvalidEntity, path)
 	}
 	return nil
 }
