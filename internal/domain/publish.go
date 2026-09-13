@@ -54,6 +54,10 @@ type PublishAttempt struct {
 
 	Status    state.PublishStatus
 	CreatedAt time.Time
+	// UpdatedAt is when the status last moved. A publisher resuming after a
+	// crash resolves an intent by its idempotency key, and needs to know not
+	// only what state it is in but when it got there.
+	UpdatedAt time.Time
 }
 
 // Validate checks publication identity and binding.
@@ -97,6 +101,13 @@ func (p PublishAttempt) Validate() error {
 	}
 	if p.CreatedAt.IsZero() {
 		return fmt.Errorf("%w: created_at is zero", ErrPublishBindingInvalid)
+	}
+	if p.UpdatedAt.IsZero() {
+		return fmt.Errorf("%w: updated_at is zero", ErrPublishBindingInvalid)
+	}
+	if p.UpdatedAt.Before(p.CreatedAt) {
+		return fmt.Errorf("%w: updated_at %s precedes created_at %s",
+			ErrPublishBindingInvalid, p.UpdatedAt.UTC(), p.CreatedAt.UTC())
 	}
 	return nil
 }

@@ -57,7 +57,11 @@ func (t *Tx) ObserveRepositorySubject(ctx context.Context, subject domain.Reposi
 		// would otherwise revert the alias, write a backwards rename into
 		// append-only history, and — because aliases are not unique — could
 		// make a legitimate alias lookup start failing as ambiguous.
-		if subject.ObservedAt.Before(existing.ObservedAt) {
+		// Not strictly Before: GitHub timestamps are second-precision, so two
+		// observations in the same second are ordinary rather than exotic,
+		// and "last writer wins" on a tie is exactly the revert this guard
+		// exists to prevent. A tie keeps what is already recorded.
+		if !subject.ObservedAt.After(existing.ObservedAt) {
 			return existing, nil
 		}
 		if _, err := t.exec(ctx,

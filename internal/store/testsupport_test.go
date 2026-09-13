@@ -189,6 +189,7 @@ func publishFor(f fixture, source domain.CommitSHA, ref string) domain.PublishAt
 		TargetRef:           ref,
 		Status:              state.PublishPending,
 		CreatedAt:           fixedNow,
+		UpdatedAt:           fixedNow,
 	}
 	p.IdempotencyKey = domain.DeriveIdempotencyKey(p)
 	return p
@@ -273,6 +274,7 @@ func fixtureForPreconditions() preconditionFixture {
 		TargetRef:           "refs/heads/m0/preconditions",
 		Status:              state.PublishPending,
 		CreatedAt:           fixedNow,
+		UpdatedAt:           fixedNow,
 	}
 	pub.IdempotencyKey = domain.DeriveIdempotencyKey(pub)
 

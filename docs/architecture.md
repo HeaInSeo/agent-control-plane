@@ -140,6 +140,14 @@ undeletable and immutable except for status, so an intent minted by a
 fenced-out attempt would sit in the pending queue for ever, resolvable only to
 `REJECTED`.
 
+A publication also records when its status last moved, and each transition
+appends an event. `task_run` carries `updated_at` and `workspace` carries
+`released_at`, so without this the most irreversible entity would have been
+the one recording nothing about when it changed — precisely what a publisher
+resuming after a crash needs. Comprehensive per-mutation history for the other
+entities is a deliberate deferral rather than an oversight; see the repository
+issues.
+
 A publication's identity is also resolvable, not only unique:
 `PublishAttemptByIdempotencyKey` and `PublishAttemptsForAttempt` let a
 publisher restarting after a crash reach the intent that already exists and
@@ -218,7 +226,10 @@ Old-epoch rows stay readable for ever. They never regain ownership.
 ### CC5 — RepositorySubject
 
 `github_node_id` is `UNIQUE` and immutable; `current_full_name` is an alias
-with an ordinary index. Observing a known node id under a new name renames the
+with an ordinary index. An observation older than or equal to the recorded one
+is ignored: GitHub timestamps are second-precision, so two observations in the
+same second are ordinary, and "last writer wins" on a tie would revert the
+alias and write a backwards rename into append-only history. Observing a known node id under a new name renames the
 existing subject and records a `repository_subject.renamed` event, so a rename
 cannot fork one repository into two subjects. Alias lookup fails closed when
 ambiguous, which is the state a recent rename produces.

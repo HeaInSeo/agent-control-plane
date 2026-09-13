@@ -199,6 +199,16 @@ func (a WorkerAttempt) Validate() error {
 	if err := a.Status.Validate(); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidEntity, err)
 	}
+	// Optional, but not optionally meaningless. A caller dereferencing an
+	// unset struct field would otherwise store a lease that expired in year
+	// one, and the first lease-expiry check would fence the attempt out
+	// immediately. Absent is fine; present and zero is not.
+	if a.LeaseExpiresAt != nil && a.LeaseExpiresAt.IsZero() {
+		return fmt.Errorf("%w: lease_expires_at is present but zero", ErrInvalidEntity)
+	}
+	if a.LastCheckpointAt != nil && a.LastCheckpointAt.IsZero() {
+		return fmt.Errorf("%w: last_checkpoint_at is present but zero", ErrInvalidEntity)
+	}
 	return nil
 }
 

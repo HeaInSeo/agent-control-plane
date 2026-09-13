@@ -539,11 +539,6 @@ BEGIN
     SELECT RAISE(ABORT, 'workspace identity must match its owning attempt');
 END;
 
--- CC3's rule is a fresh isolated clone per modifying attempt, so the
--- isolation kind is determined by the attempt's intent rather than chosen
--- freely. Without this a MODIFYING attempt could own a READ_ONLY_CHECKOUT and
--- still publish from it: the publish coherence trigger checks the attempt's
--- intent, the workspace's owner and its base SHA, but not its isolation.
 -- A finished task takes on no new durable state. The Go store enforces this,
 -- but so must the schema: this file's premise is that a future code path
 -- cannot bypass an invariant by forgetting a check, and withdrawal leaves the
@@ -556,6 +551,11 @@ BEGIN
     SELECT RAISE(ABORT, 'a terminal task cannot take a new workspace');
 END;
 
+-- CC3's rule is a fresh isolated clone per modifying attempt, so the
+-- isolation kind is determined by the attempt's intent rather than chosen
+-- freely. Without this a MODIFYING attempt could own a READ_ONLY_CHECKOUT and
+-- still publish from it: the publish coherence trigger checks the attempt's
+-- intent, the workspace's owner and its base SHA, but not its isolation.
 CREATE TRIGGER trg_workspace_isolation_matches_intent
 BEFORE INSERT ON workspace
 FOR EACH ROW
@@ -638,7 +638,12 @@ CREATE TABLE publish_attempt (
     idempotency_key       TEXT NOT NULL UNIQUE CHECK (length(idempotency_key) > 0),
 
     status                TEXT NOT NULL CHECK (status IN ('PENDING', 'APPLIED', 'OBSERVED', 'REJECTED', 'UNKNOWN')),
-    created_at            TEXT NOT NULL
+    created_at            TEXT NOT NULL,
+    -- When the status last moved. task_run carries updated_at and workspace
+    -- carries released_at; without this the single most irreversible entity
+    -- would be the one recording nothing about when it changed, which is
+    -- exactly what a publisher resuming after a crash needs to know.
+    updated_at            TEXT NOT NULL
 ) WITHOUT ROWID;
 
 CREATE INDEX ix_publish_attempt_attempt ON publish_attempt (attempt_id);
@@ -651,9 +656,6 @@ BEGIN
     SELECT RAISE(ABORT, 'publish_attempt must bind the current scheduler epoch');
 END;
 
--- Every identity field must agree with the attempt and the workspace. A stale
--- or foreign attempt therefore cannot borrow another attempt's publication
--- identity or another workspace's commit metadata.
 -- Publication is the irreversible step, so the task-liveness fence matters
 -- most here: a cancelled task whose push still went out is the worst outcome
 -- this control plane can produce.
@@ -665,6 +667,9 @@ BEGIN
     SELECT RAISE(ABORT, 'a terminal task cannot publish');
 END;
 
+-- Every identity field must agree with the attempt and the workspace. A stale
+-- or foreign attempt therefore cannot borrow another attempt's publication
+-- identity or another workspace's commit metadata.
 CREATE TRIGGER trg_publish_attempt_binding_coherence
 BEFORE INSERT ON publish_attempt
 FOR EACH ROW
@@ -720,9 +725,10 @@ WHEN NEW.publish_attempt_id    <> OLD.publish_attempt_id
   OR NEW.base_sha              <> OLD.base_sha
   OR NEW.source_commit_sha     <> OLD.source_commit_sha
   OR NEW.target_ref            <> OLD.target_ref
-  OR NEW.idempotency_key       <> OLD.idempotency_key
+  OR NEW.idempotency_key       IS NOT OLD.idempotency_key
+  OR NEW.created_at            IS NOT OLD.created_at
 BEGIN
-    SELECT RAISE(ABORT, 'publish_attempt identity is immutable; only status may change');
+    SELECT RAISE(ABORT, 'publish_attempt identity is immutable; only status and updated_at may change');
 END;
 
 CREATE TRIGGER trg_publish_attempt_no_delete
@@ -779,7 +785,6 @@ CREATE TABLE evidence_observation (
 
 CREATE INDEX ix_evidence_attempt ON evidence_observation (attempt_id);
 
--- Evidence must be about the attempt it names, in every identity dimension.
 -- An observation filed against a finished task is permanent state belonging
 -- to work that is over: immutable, undeletable, and rejected by completion.
 CREATE TRIGGER trg_evidence_task_not_terminal
@@ -790,6 +795,7 @@ BEGIN
     SELECT RAISE(ABORT, 'a terminal task cannot record evidence');
 END;
 
+-- Evidence must be about the attempt it names, in every identity dimension.
 CREATE TRIGGER trg_evidence_attribution_coherence
 BEFORE INSERT ON evidence_observation
 FOR EACH ROW

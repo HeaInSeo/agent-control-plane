@@ -62,6 +62,9 @@ func (t *Tx) RecordPublishAttempt(ctx context.Context, p domain.PublishAttempt) 
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = t.Now()
 	}
+	if p.UpdatedAt.IsZero() {
+		p.UpdatedAt = p.CreatedAt
+	}
 	if err := p.Validate(); err != nil {
 		return err
 	}
@@ -121,12 +124,13 @@ func (t *Tx) RecordPublishAttempt(ctx context.Context, p domain.PublishAttempt) 
 		`INSERT INTO publish_attempt (publish_attempt_id, task_id, attempt_id,
 		                              scheduler_epoch, fence_epoch, workspace_id,
 		                              repository_subject_id, base_sha, source_commit_sha,
-		                              target_ref, idempotency_key, status, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		                              target_ref, idempotency_key, status, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		string(p.PublishAttemptID), string(p.TaskID), string(p.AttemptID),
 		int64(p.SchedulerEpoch), int64(p.FenceEpoch), string(p.WorkspaceID),
 		string(p.RepositorySubjectID), string(p.BaseSHA), string(p.SourceCommitSHA),
-		p.TargetRef, p.IdempotencyKey, string(p.Status), formatTime(p.CreatedAt))
+		p.TargetRef, p.IdempotencyKey, string(p.Status),
+		formatTime(p.CreatedAt), formatTime(p.UpdatedAt))
 	if err != nil {
 		if isUniqueViolationOn(err, "publish_attempt.idempotency_key") {
 			return fmt.Errorf("%w: idempotency_key %s is already recorded; "+
@@ -145,16 +149,17 @@ func (t *Tx) PublishAttempt(ctx context.Context, id ids.PublishAttemptID) (domai
 		pubID, taskID, attemptID, workspaceID string
 		repoSubject, baseSHA, sourceSHA       string
 		targetRef, idemKey, status, createdAt string
+		updatedAt                             string
 		schedEpoch, fenceEpoch                int64
 	)
 	err := t.tx.QueryRowContext(ctx,
 		`SELECT publish_attempt_id, task_id, attempt_id, scheduler_epoch, fence_epoch,
 		        workspace_id, repository_subject_id, base_sha, source_commit_sha,
-		        target_ref, idempotency_key, status, created_at
+		        target_ref, idempotency_key, status, created_at, updated_at
 		   FROM publish_attempt WHERE publish_attempt_id = ?`, string(id),
 	).Scan(&pubID, &taskID, &attemptID, &schedEpoch, &fenceEpoch,
 		&workspaceID, &repoSubject, &baseSHA, &sourceSHA,
-		&targetRef, &idemKey, &status, &createdAt)
+		&targetRef, &idemKey, &status, &createdAt, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return out, fmt.Errorf("%w: publish attempt %s", ErrNotFound, string(id))
 	}
@@ -162,6 +167,10 @@ func (t *Tx) PublishAttempt(ctx context.Context, id ids.PublishAttemptID) (domai
 		return out, fmt.Errorf("read publish attempt: %w", err)
 	}
 	created, err := parseTime(createdAt)
+	if err != nil {
+		return out, err
+	}
+	updated, err := parseTime(updatedAt)
 	if err != nil {
 		return out, err
 	}
@@ -179,6 +188,7 @@ func (t *Tx) PublishAttempt(ctx context.Context, id ids.PublishAttemptID) (domai
 		IdempotencyKey:      idemKey,
 		Status:              state.PublishStatus(status),
 		CreatedAt:           created,
+		UpdatedAt:           updated,
 	}, nil
 }
 
@@ -288,9 +298,37 @@ func (t *Tx) SetPublishStatus(ctx context.Context, id ids.PublishAttemptID, stat
 		return fmt.Errorf("%w: publication %s cannot move from %q to %q",
 			ErrForbiddenPublishTransition, string(id), string(current.Status), string(status))
 	}
-	return t.exactlyOne(ctx, "publish attempt", string(id),
-		`UPDATE publish_attempt SET status = ? WHERE publish_attempt_id = ?`,
-		string(status), string(id))
+	now := t.Now()
+	if err := t.exactlyOne(ctx, "publish attempt", string(id),
+		`UPDATE publish_attempt SET status = ?, updated_at = ? WHERE publish_attempt_id = ?`,
+		string(status), formatTime(now), string(id)); err != nil {
+		return err
+	}
+	// Publication is the irreversible step, so its lifecycle leaves a trace in
+	// the append-only history a resuming publisher replays. Comprehensive
+	// per-mutation history for the other entities is deferred; see the
+	// repository issues.
+	epoch, err := t.CurrentEpoch(ctx)
+	if err != nil {
+		return err
+	}
+	taskID, attemptID := current.TaskID, current.AttemptID
+	_, err = t.AppendEvent(ctx, domain.Event{
+		SchedulerEpoch: epoch,
+		EventID:        ids.NewEventID(),
+		OccurredAt:     now,
+		EventType:      "publish_attempt.status_changed",
+		SubjectKind:    domain.SubjectPublishAttempt,
+		SubjectID:      string(id),
+		TaskID:         &taskID,
+		AttemptID:      &attemptID,
+		Fields: map[string]any{
+			"previous_status": string(current.Status),
+			"current_status":  string(status),
+			"target_ref":      current.TargetRef,
+		},
+	})
+	return err
 }
 
 // ---------------------------------------------------------------------------
