@@ -141,7 +141,9 @@ func (db *DB) Migrate(ctx context.Context, set []Migration) error {
 			return fmt.Errorf("apply migration %04d_%s: %w", m.Version, m.Name, err)
 		}
 	}
-	return nil
+	// The database now implements this build's contract. This is the step
+	// that makes an older contract upgradeable rather than fatal.
+	return db.refreshContractMarker(ctx)
 }
 
 // MigrateEmbedded brings the database up to the embedded migration set.
@@ -157,8 +159,39 @@ func (db *DB) MigrateEmbedded(ctx context.Context) error {
 // non-empty database that does not carry it.
 const dbKind = "agent-control-plane"
 
-// dbContract is the contract version of the durable layout.
+// dbContract is the contract version of the durable layout this build
+// implements. It is written by bootstrap and refreshed after a successful
+// migration to the full embedded set.
 const dbContract = "v0.1"
+
+// supportedContracts lists the contract versions this build can open, oldest
+// first, ending with dbContract.
+//
+// An older contract must be openable, or the first bump would brick every
+// existing database: verifyOwnMarker runs inside Open, Open is the only way
+// to obtain a *DB, and Migrate is the only thing that could rewrite the
+// marker — so refusing an older contract at open time would leave no in-tree
+// path to upgrade it, and recovery would mean hand-editing the one file this
+// package exists to protect. A newer contract is still refused: that database
+// carries invariants this build does not know.
+var supportedContracts = []string{"v0.1"}
+
+// contractSupported reports whether this build can open a database declaring
+// the given contract.
+func contractSupported(contract string) bool {
+	return slices.Contains(supportedContracts, contract)
+}
+
+// refreshContractMarker records that the database now implements this build's
+// contract. Called after the migration set has been fully applied.
+func (db *DB) refreshContractMarker(ctx context.Context) error {
+	if _, err := db.sql.ExecContext(ctx,
+		`UPDATE control_plane_meta SET value = ? WHERE key = 'db_contract'`, dbContract,
+	); err != nil {
+		return fmt.Errorf("store: refresh contract marker: %w", err)
+	}
+	return nil
+}
 
 // bootstrap creates the database identity marker and the migration ledger in a
 // single transaction, before any migration runs.

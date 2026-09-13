@@ -137,6 +137,18 @@ func ValidateTargetRef(ref string) error {
 	if strings.Contains(ref, "@{") {
 		return fmt.Errorf("%w: target_ref %q contains %q", ErrPublishTargetInvalid, ref, "@{")
 	}
+	// Whole-refname rules, not per-component ones. git check-ref-format
+	// accepts refs/heads/v2./fix and refs/heads/@ — only the refname as a
+	// whole may not end in "." or be the single character "@". Applying
+	// these per component rejected legitimate branches, and since the schema
+	// mirrors this validator such a branch would be permanently
+	// unpublishable.
+	if strings.HasSuffix(ref, ".") {
+		return fmt.Errorf("%w: target_ref %q ends with %q", ErrPublishTargetInvalid, ref, ".")
+	}
+	if ref == "@" {
+		return fmt.Errorf("%w: target_ref cannot be %q", ErrPublishTargetInvalid, "@")
+	}
 
 	components := strings.Split(ref, "/")
 	for _, component := range components {
@@ -165,17 +177,9 @@ func validateRefComponent(ref, component string) error {
 		return fmt.Errorf("%w: target_ref %q has a component starting with %q",
 			ErrPublishTargetInvalid, ref, ".")
 	}
-	if strings.HasSuffix(component, ".") {
-		return fmt.Errorf("%w: target_ref %q has a component ending with %q",
-			ErrPublishTargetInvalid, ref, ".")
-	}
 	if strings.HasSuffix(component, ".lock") {
 		return fmt.Errorf("%w: target_ref %q has a component ending with %q",
 			ErrPublishTargetInvalid, ref, ".lock")
-	}
-	if component == "@" {
-		return fmt.Errorf("%w: target_ref %q has a component that is just %q",
-			ErrPublishTargetInvalid, ref, "@")
 	}
 	if strings.ContainsAny(component, refBadChars) {
 		return fmt.Errorf("%w: target_ref %q contains a character Git rejects",

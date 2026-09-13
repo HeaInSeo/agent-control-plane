@@ -505,9 +505,9 @@ func (db *DB) verifyOwnMarker(ctx context.Context) error {
 		return fmt.Errorf("%w: %s carries no db_contract marker", ErrUnsupportedContract, db.path)
 	case err != nil:
 		return fmt.Errorf("%w: %s: %w", ErrUnsupportedContract, db.path, err)
-	case contract != dbContract:
-		return fmt.Errorf("%w: %s declares db_contract %q, this build implements %q",
-			ErrUnsupportedContract, db.path, contract, dbContract)
+	case !contractSupported(contract):
+		return fmt.Errorf("%w: %s declares db_contract %q, this build supports %v",
+			ErrUnsupportedContract, db.path, contract, supportedContracts)
 	}
 	return nil
 }

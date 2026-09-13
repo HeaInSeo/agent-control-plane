@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/HeaInSeo/agent-control-plane/internal/domain"
 	"github.com/HeaInSeo/agent-control-plane/internal/ids"
@@ -64,12 +65,36 @@ var ErrWorkspaceConflict = errors.New("workspace conflicts with an existing work
 // is exact-string on the "<path>/" prefix rather than a pattern match,
 // because a legitimate path may contain GLOB or LIKE metacharacters.
 func (t *Tx) requireUnnestedWorkspacePath(ctx context.Context, path string) error {
+	// Both directions are index-backed, so this does not degrade as the
+	// workspace table grows — and it never shrinks, since workspaces reject
+	// DELETE.
+	//
+	// "path is inside an existing workspace" is an equality test against each
+	// of path's ancestors, of which there are only as many as the path has
+	// components, and root_path is UNIQUE.
+	//
+	// "an existing workspace is inside path" is a range scan on the same
+	// index: every descendant of path sorts between "path/" and "path0",
+	// because '0' is the byte after '/'.
+	ancestors := pathAncestors(path)
+	args := make([]any, 0, len(ancestors)+2)
+	placeholders := make([]string, 0, len(ancestors))
+	for _, ancestor := range ancestors {
+		placeholders = append(placeholders, "?")
+		args = append(args, ancestor)
+	}
+	args = append(args, path+"/", path+"0")
+
+	query := `SELECT root_path FROM workspace WHERE root_path > ? AND root_path < ? LIMIT 1`
+	if len(ancestors) > 0 {
+		query = `SELECT root_path FROM workspace
+		          WHERE root_path IN (` + strings.Join(placeholders, ", ") + `)
+		             OR (root_path > ? AND root_path < ?)
+		          LIMIT 1`
+	}
+
 	var existing string
-	err := t.tx.QueryRowContext(ctx,
-		`SELECT root_path FROM workspace
-		  WHERE substr(?, 1, length(root_path) + 1) = root_path || '/'
-		     OR substr(root_path, 1, length(?) + 1) = ? || '/'
-		  LIMIT 1`, path, path, path).Scan(&existing)
+	err := t.tx.QueryRowContext(ctx, query, args...).Scan(&existing)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -78,6 +103,22 @@ func (t *Tx) requireUnnestedWorkspacePath(ctx context.Context, path string) erro
 	}
 	return fmt.Errorf("%w: %s nests with existing workspace %s",
 		ErrWorkspaceConflict, path, existing)
+}
+
+// pathAncestors returns the proper ancestor directories of an absolute,
+// canonical path, from the root down. The path itself is excluded: an exact
+// duplicate is already caught by UNIQUE(root_path).
+func pathAncestors(path string) []string {
+	trimmed := strings.Trim(path, "/")
+	if trimmed == "" {
+		return nil
+	}
+	segments := strings.Split(trimmed, "/")
+	ancestors := make([]string, 0, len(segments)-1)
+	for i := 1; i < len(segments); i++ {
+		ancestors = append(ancestors, "/"+strings.Join(segments[:i], "/"))
+	}
+	return ancestors
 }
 
 // isolationFor reports the isolation kind an attempt of this intent requires.

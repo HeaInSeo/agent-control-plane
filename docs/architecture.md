@@ -216,7 +216,12 @@ mistake, it does not stop a determined caller naming a bad directory two
 levels down.
 
 Containment is covered: a path nested inside an existing workspace, or
-containing one, is refused. `UNIQUE(root_path)` and canonicalisation only rule
+containing one, is refused. The check is index-backed in both directions, so
+it does not degrade as the table grows — and it never shrinks, since
+workspaces reject `DELETE`. "Inside an existing workspace" is an equality test
+against the path's ancestors, of which there are only as many as the path has
+components; "contains an existing workspace" is a range scan over the same
+unique index, because every descendant sorts between `path/` and `path0`. `UNIQUE(root_path)` and canonicalisation only rule
 out two spellings of the same string, and a nested tree means one attempt's
 clone contains another's — visible to its `git status`, publishable by it, and
 destroyed along with it. Unlike symlinks this is detectable purely lexically,
@@ -487,6 +492,14 @@ WAL, a single connection matching the single-active-scheduler model, and
 The `db_contract` marker is checked on open, not merely written: an unread
 marker looks like a fail-closed guard while being inert, and a future build
 that bumps the contract would open an older database without noticing.
+
+It is checked against a list of supported contracts rather than for equality,
+and refreshed after a successful migration. Equality would have made the first
+bump fatal: `verifyOwnMarker` runs inside `Open`, `Open` is the only way to
+obtain a handle, and `Migrate` is the only thing that could rewrite the
+marker — so refusing an older contract would leave no in-tree path to upgrade
+it, and recovery would mean hand-editing the one file this package exists to
+protect. A newer contract is still refused.
 
 Open also refuses a database whose recorded migration history does not match
 this build's — a newer version, a tampered checksum, or a migration name this

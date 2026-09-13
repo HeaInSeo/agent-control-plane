@@ -283,14 +283,14 @@ func TestTargetRefHeadMatchingIsComponentWise(t *testing.T) {
 func TestTargetRefFollowsGitCheckRefFormat(t *testing.T) {
 	for _, bad := range []string{
 		"refs/heads/.hidden",     // component starting with a dot
-		"refs/heads/a.",          // component ending with a dot
 		"refs/heads//double",     // empty component
 		"refs/heads/@{upstream}", // @{ sequence
 		"refs/heads/a\x01b",      // control character
 		"refs/heads/a\x7fb",      // DEL
 		"refs/heads/x.lock/y",    // .lock on an inner component
 		"refs/heads/x.lock",      // .lock on the last component
-		"refs/heads/@",           // a component that is just @
+		"refs/heads/release.",    // the refname as a whole ends with a dot
+		"@",                      // the refname is exactly @
 		"refs/heads/a:b",
 		"refs/heads/a?b",
 		"refs/heads/a[b",
@@ -312,6 +312,12 @@ func TestTargetRefFollowsGitCheckRefFormat(t *testing.T) {
 		"refs/heads/user@example",
 		"refs/pull/12/head",
 		"refs/tags/v1.0.0",
+		// Accepted by git check-ref-format (verified against git 2.43.7):
+		// only the refname as a whole may not be "@" or end in ".".
+		// Rejecting these made a legitimate branch permanently
+		// unpublishable, since the schema mirrors this validator.
+		"refs/heads/@",
+		"refs/heads/v2./fix",
 	} {
 		if err := domain.ValidateTargetRef(ok); err != nil {
 			t.Fatalf("%q rejected: %v", ok, err)

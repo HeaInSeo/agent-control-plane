@@ -3,6 +3,7 @@ package domain_test
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -354,5 +355,62 @@ func TestExportedRedactFieldsHandlesUnnormalisedShapes(t *testing.T) {
 	}
 	if out["lane"] != "operator" {
 		t.Fatalf("non-sensitive scalar was altered: %v", out["lane"])
+	}
+}
+
+// Finding 18.1: when normalisation failed for the map as a whole — one NaN or
+// infinite float, one channel or function is enough — the fallback returned
+// every typed container verbatim, so an unrelated telemetry value defeated
+// redaction for all its siblings.
+func TestRedactionFailsClosedOnUnencodableValues(t *testing.T) {
+	type creds struct {
+		Token string `json:"github_token"`
+	}
+	for name, poison := range map[string]any{
+		"NaN":      math.NaN(),
+		"+Inf":     math.Inf(1),
+		"-Inf":     math.Inf(-1),
+		"channel":  make(chan int),
+		"function": func() {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			out := domain.RedactFields(map[string]any{
+				"ratio":      poison,
+				"req":        map[string]string{"authorization": "Bearer fake-not-a-real-secret"},
+				"structured": creds{Token: "fake-not-a-real-secret"},
+				"lane":       "operator",
+			})
+
+			// The unencodable value is replaced rather than passed through,
+			// and named for what it is rather than as a credential.
+			if out["ratio"] != domain.Unencodable {
+				t.Fatalf("unencodable value came back as %v", out["ratio"])
+			}
+			// Its siblings are still redacted.
+			req, ok := out["req"].(map[string]any)
+			if !ok {
+				t.Fatalf("sibling container was returned verbatim: %#v", out["req"])
+			}
+			if req["authorization"] != domain.Redacted {
+				t.Fatalf("a credential survived beside an unencodable value: %v", req)
+			}
+			structured, ok := out["structured"].(map[string]any)
+			if !ok {
+				t.Fatalf("sibling struct was returned verbatim: %#v", out["structured"])
+			}
+			if structured["github_token"] != domain.Redacted {
+				t.Fatalf("a struct credential survived: %v", structured)
+			}
+			if out["lane"] != "operator" {
+				t.Fatalf("a non-sensitive sibling was altered: %v", out["lane"])
+			}
+		})
+	}
+
+	// A sensitive key holding an unencodable value is still redacted, not
+	// reported as merely unencodable.
+	out := domain.RedactFields(map[string]any{"github_token": math.NaN()})
+	if out["github_token"] != domain.Redacted {
+		t.Fatalf("a sensitive key came back as %v", out["github_token"])
 	}
 }

@@ -22,6 +22,14 @@ var ErrEventInvalid = errors.New("event invalid")
 // helpers, SSH material and authorization headers.
 const Redacted = "[REDACTED]"
 
+// Unencodable is the placeholder substituted for a value that cannot be
+// normalised for inspection — a NaN or infinite float, a channel, a function.
+//
+// It is deliberately distinct from Redacted: such a value is not known to be
+// a credential, only impossible to look inside, and passing it through would
+// mean storing something redaction never examined.
+const Unencodable = "[UNENCODABLE]"
+
 // SubjectKind names the entity an event is about.
 type SubjectKind string
 
@@ -178,12 +186,28 @@ func RedactFields(in map[string]any) map[string]any {
 	// verbatim — and a caller reading this function's documentation would
 	// reasonably expect its bearer token to have been replaced.
 	if normalised, err := normaliseFields(in); err == nil {
-		in = normalised
+		return redactNormalised(normalised)
 	}
-	// A normalisation failure (a cyclic value) falls through to the direct
-	// walk, which is depth-bounded and still redacts every JSON-shaped
-	// container it meets. EncodeFields reports the cycle as an error.
-	return redactNormalised(in)
+	// Normalisation failed for the map as a whole — one NaN or infinite
+	// float, one channel or function anywhere in it is enough. Falling back
+	// to the direct walk here would return every typed container verbatim,
+	// so one unrelated telemetry value would defeat redaction for all its
+	// siblings. Instead each key is normalised on its own, and a value that
+	// still cannot be inspected is replaced rather than passed through.
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		if isSensitiveKey(k) {
+			out[k] = Redacted
+			continue
+		}
+		single, err := normaliseFields(map[string]any{k: v})
+		if err != nil {
+			out[k] = Unencodable
+			continue
+		}
+		out[k] = redactValue(single[k], 1)
+	}
+	return out
 }
 
 // redactNormalised walks values already reduced to JSON shapes.

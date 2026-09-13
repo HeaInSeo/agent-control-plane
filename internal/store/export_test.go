@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/HeaInSeo/agent-control-plane/internal/domain"
 )
@@ -87,4 +88,32 @@ func (t *Tx) AppendEventAt(ctx context.Context, e domain.Event, seq int64) error
 		return fmt.Errorf("append event at seq %d: %w", seq, err)
 	}
 	return nil
+}
+
+// QueryPlanForTest returns SQLite's plan for a query as a single string.
+//
+// Used to assert that an invariant check is index-backed rather than a table
+// scan — a property that matters for a table which only ever grows.
+func (t *Tx) QueryPlanForTest(ctx context.Context, query string, args ...any) (string, error) {
+	rows, err := t.tx.QueryContext(ctx, "EXPLAIN QUERY PLAN "+query, args...)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	var details []string
+	for rows.Next() {
+		var (
+			id, parent, notUsed int64
+			detail              string
+		)
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			return "", err
+		}
+		details = append(details, detail)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	return strings.Join(details, " | "), nil
 }

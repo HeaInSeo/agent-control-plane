@@ -42,6 +42,8 @@ CREATE TABLE scheduler_ownership (
     acquired_at   TEXT NOT NULL
 );
 
+-- Ownership only ever moves to a later generation. A retired scheduler must
+-- not be able to reinstate itself as the owner.
 CREATE TRIGGER trg_scheduler_ownership_no_regress
 BEFORE UPDATE ON scheduler_ownership
 FOR EACH ROW
@@ -59,12 +61,15 @@ BEGIN
     SELECT RAISE(ABORT, 'scheduler epochs are durable and cannot be deleted');
 END;
 
+-- Deleting the ownership row would reset ownership entirely, letting any
+-- generation claim it afresh.
 CREATE TRIGGER trg_scheduler_ownership_no_delete
 BEFORE DELETE ON scheduler_ownership
 BEGIN
     SELECT RAISE(ABORT, 'scheduler ownership cannot be deleted');
 END;
 
+-- Generations are numbered forward only, so an epoch number is never reused.
 CREATE TRIGGER trg_scheduler_epoch_monotonic
 BEFORE INSERT ON scheduler_epoch
 FOR EACH ROW
@@ -239,6 +244,8 @@ CREATE TABLE task_run (
 CREATE INDEX ix_task_run_repository ON task_run (repository_subject_id);
 CREATE INDEX ix_task_run_status ON task_run (status);
 
+-- A task must match the packet it was approved under on every identity
+-- field, or it would be executing under authority granted for other work.
 CREATE TRIGGER trg_task_run_packet_coherence
 BEFORE INSERT ON task_run
 FOR EACH ROW
@@ -269,6 +276,7 @@ BEGIN
     SELECT RAISE(ABORT, 'completion evidence must be attributed to this task');
 END;
 
+-- Completion evidence must be evidence about this very task.
 CREATE TRIGGER trg_task_run_completion_evidence_binding
 BEFORE UPDATE ON task_run
 FOR EACH ROW
@@ -337,6 +345,7 @@ BEGIN
     SELECT RAISE(ABORT, 'current_attempt_id must belong to this task');
 END;
 
+-- A task may only point at an attempt that belongs to it.
 CREATE TRIGGER trg_task_run_current_attempt_binding
 BEFORE UPDATE ON task_run
 FOR EACH ROW
@@ -469,6 +478,8 @@ BEGIN
     SELECT RAISE(ABORT, 'worker_attempt must bind the current scheduler epoch');
 END;
 
+-- An attempt must match its task on repository subject, packet, lane and
+-- intent: those are the task's authority, not the attempt's to choose.
 CREATE TRIGGER trg_worker_attempt_task_coherence
 BEFORE INSERT ON worker_attempt
 FOR EACH ROW
@@ -503,6 +514,8 @@ BEGIN
 END;
 
 
+-- Fencing tokens are issued forward only within a task, so a fenced-out
+-- attempt cannot reissue its own token.
 CREATE TRIGGER trg_worker_attempt_fence_monotonic
 BEFORE INSERT ON worker_attempt
 FOR EACH ROW
@@ -511,6 +524,8 @@ BEGIN
     SELECT RAISE(ABORT, 'fence_epoch must be monotonic within a task');
 END;
 
+-- An attempt's identity is fixed at admission; only status, lease and
+-- checkpoint move.
 CREATE TRIGGER trg_worker_attempt_identity_immutable
 BEFORE UPDATE ON worker_attempt
 FOR EACH ROW
@@ -604,6 +619,8 @@ BEGIN
     SELECT RAISE(ABORT, 'workspace root_path cannot nest inside another workspace');
 END;
 
+-- A workspace's task and repository subject must match the attempt that
+-- owns it.
 CREATE TRIGGER trg_workspace_attempt_coherence
 BEFORE INSERT ON workspace
 FOR EACH ROW
@@ -654,6 +671,8 @@ BEGIN
     SELECT RAISE(ABORT, 'a terminal attempt cannot take a new workspace');
 END;
 
+-- Workspace ownership is fixed at creation: a workspace cannot be rebound
+-- to another attempt, and only released_at moves.
 CREATE TRIGGER trg_workspace_ownership_immutable
 BEFORE UPDATE ON workspace
 FOR EACH ROW
@@ -685,6 +704,8 @@ BEGIN
     SELECT RAISE(ABORT, 'workspace release is final');
 END;
 
+-- Workspaces are durable: deleting one would let its unique directory be
+-- re-registered under different ownership.
 CREATE TRIGGER trg_workspace_no_delete
 BEFORE DELETE ON workspace
 BEGIN
@@ -740,6 +761,8 @@ CREATE TABLE publish_attempt (
 
 CREATE INDEX ix_publish_attempt_attempt ON publish_attempt (attempt_id);
 
+-- Publication is an exercise of scheduler ownership, so it binds the
+-- current generation.
 CREATE TRIGGER trg_publish_attempt_epoch_current
 BEFORE INSERT ON publish_attempt
 FOR EACH ROW
@@ -826,6 +849,8 @@ BEGIN
     SELECT RAISE(ABORT, 'a terminal attempt cannot publish');
 END;
 
+-- A publication's binding is fixed at record time; only its status and
+-- updated_at move. Rebinding it would repoint an approved effect.
 CREATE TRIGGER trg_publish_attempt_identity_immutable
 BEFORE UPDATE ON publish_attempt
 FOR EACH ROW
@@ -845,6 +870,8 @@ BEGIN
     SELECT RAISE(ABORT, 'publish_attempt identity is immutable; only status and updated_at may change');
 END;
 
+-- Publication records are durable: deleting one would free its idempotency
+-- key for reuse by a different intent.
 CREATE TRIGGER trg_publish_attempt_no_delete
 BEFORE DELETE ON publish_attempt
 BEGIN
@@ -922,8 +949,18 @@ BEGIN
     SELECT RAISE(ABORT, 'evidence_observation must be attributed to its own attempt identity');
 END;
 
--- If evidence names a publication, it must be that attempt's publication and
--- must carry that publication's exact commit.
+-- If evidence names a publication, it must be that attempt's publication
+-- and must carry that publication's exact commit.
+CREATE TRIGGER trg_evidence_publish_coherence
+BEFORE INSERT ON evidence_observation
+FOR EACH ROW
+WHEN NEW.publish_attempt_id IS NOT NULL
+  AND ((SELECT attempt_id FROM publish_attempt WHERE publish_attempt_id = NEW.publish_attempt_id) IS NOT NEW.attempt_id
+    OR (SELECT source_commit_sha FROM publish_attempt WHERE publish_attempt_id = NEW.publish_attempt_id) IS NOT NEW.published_sha)
+BEGIN
+    SELECT RAISE(ABORT, 'evidence published_sha must equal its publish_attempt source_commit_sha');
+END;
+
 -- Read-only review evidence names the commit the review ran against, so it
 -- must be the commit the workspace was checked out at. Comparing reviewed_sha
 -- only against observed_sha and published_sha compares caller-supplied values
@@ -940,16 +977,8 @@ BEGIN
     SELECT RAISE(ABORT, 'reviewed_sha must be the workspace base_sha');
 END;
 
-CREATE TRIGGER trg_evidence_publish_coherence
-BEFORE INSERT ON evidence_observation
-FOR EACH ROW
-WHEN NEW.publish_attempt_id IS NOT NULL
-  AND ((SELECT attempt_id FROM publish_attempt WHERE publish_attempt_id = NEW.publish_attempt_id) IS NOT NEW.attempt_id
-    OR (SELECT source_commit_sha FROM publish_attempt WHERE publish_attempt_id = NEW.publish_attempt_id) IS NOT NEW.published_sha)
-BEGIN
-    SELECT RAISE(ABORT, 'evidence published_sha must equal its publish_attempt source_commit_sha');
-END;
-
+-- A released workspace cannot record evidence: the tree the observation
+-- refers to is gone.
 CREATE TRIGGER trg_evidence_workspace_live
 BEFORE INSERT ON evidence_observation
 FOR EACH ROW
@@ -970,6 +999,8 @@ BEGIN
     SELECT RAISE(ABORT, 'a terminal attempt cannot record evidence');
 END;
 
+-- Observations are immutable. An observation that could be edited is not
+-- evidence of anything.
 CREATE TRIGGER trg_evidence_immutable
 BEFORE UPDATE ON evidence_observation
 FOR EACH ROW
@@ -1008,12 +1039,14 @@ CREATE TABLE event (
     PRIMARY KEY (scheduler_epoch, seq)
 ) WITHOUT ROWID;
 
+-- History is append-only: a record that can be rewritten is not history.
 CREATE TRIGGER trg_event_no_update
 BEFORE UPDATE ON event
 BEGIN
     SELECT RAISE(ABORT, 'event history is append-only');
 END;
 
+-- And append-only means undeletable, not merely unrewritable.
 CREATE TRIGGER trg_event_no_delete
 BEFORE DELETE ON event
 BEGIN

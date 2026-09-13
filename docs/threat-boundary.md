@@ -286,6 +286,12 @@ That is deliberate: none of those words is part of the event vocabulary this
 control plane writes, and for a name that reads as a bare credential word the
 safe reading is that it holds one.
 
+A value JSON cannot encode — a NaN or infinite float, a channel, a function —
+is replaced with an explicit `[UNENCODABLE]` marker rather than passed
+through, and its siblings are still redacted. Failing over to an
+uninspected walk would have let one unrelated telemetry value defeat
+redaction for every other field in the same event.
+
 This is defence in depth, not a licence to pass secrets: key-name matching
 cannot catch a credential stored under an innocuous name, one embedded in a
 free-text message, one sitting as a bare element of a list where there is no

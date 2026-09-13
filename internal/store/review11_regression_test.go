@@ -202,46 +202,41 @@ func TestPublicationRecordsWhenItMoved(t *testing.T) {
 // inserted beneath them, so each documented the wrong trigger. In a schema
 // whose comments carry the invariant reasoning, that misleads a maintainer
 // into relaxing the wrong rule.
-func TestMigrationCommentsHeadTheirOwnTrigger(t *testing.T) {
+//
+// The original version of this test compared a hand-maintained map of comment
+// markers to trigger names, and missed the same defect twice — once in round
+// 13 and again in round 18 — because the map was never extended for the new
+// triggers. So the rule is structural instead: every CREATE TRIGGER carries
+// its own rationale immediately above it. Inserting a trigger beneath an
+// existing rationale displaces the trigger that rationale belonged to, and
+// that trigger then has none, which this detects without anyone remembering
+// to register anything.
+func TestEveryTriggerCarriesItsOwnRationale(t *testing.T) {
 	set, err := store.Migrations()
 	if err != nil {
 		t.Fatalf("migrations: %v", err)
 	}
-
-	// Each rationale block must be immediately followed by the trigger it
-	// describes, with no other CREATE TRIGGER in between.
-	expected := map[string]string{
-		"CC3's rule is a fresh isolated clone":                   "trg_workspace_isolation_matches_intent",
-		"Every identity field must agree with the attempt":       "trg_publish_attempt_binding_coherence",
-		"Evidence must be about the attempt it names":            "trg_evidence_attribution_coherence",
-		"A finished task takes on no new durable state":          "trg_workspace_task_not_terminal",
-		"Publication is the irreversible step, so the task-live": "trg_publish_attempt_task_not_terminal",
-		"An observation filed against a finished task":           "trg_evidence_task_not_terminal",
-	}
-
 	for _, m := range set {
 		lines := strings.Split(m.SQL, "\n")
-		for marker, trigger := range expected {
-			idx := -1
-			for i, line := range lines {
-				if strings.Contains(line, marker) {
-					idx = i
-					break
-				}
-			}
-			if idx < 0 {
+		triggers := 0
+		for i, line := range lines {
+			if !strings.HasPrefix(line, "CREATE TRIGGER ") {
 				continue
 			}
-			found := ""
-			for i := idx; i < len(lines); i++ {
-				if strings.HasPrefix(lines[i], "CREATE TRIGGER ") {
-					found = strings.TrimSpace(strings.TrimPrefix(lines[i], "CREATE TRIGGER "))
-					break
-				}
+			triggers++
+			name := strings.Fields(line)[2]
+			if i == 0 {
+				t.Fatalf("%04d_%s: trigger %s has no rationale above it", m.Version, m.Name, name)
 			}
-			if found != trigger {
-				t.Fatalf("the %q rationale heads %q, but describes %q", marker, found, trigger)
+			if !strings.HasPrefix(strings.TrimSpace(lines[i-1]), "--") {
+				t.Fatalf("%04d_%s: trigger %s has no rationale immediately above it "+
+					"(line %d is %q) — a trigger inserted beneath another trigger's "+
+					"rationale displaces it, which is what this checks for",
+					m.Version, m.Name, name, i, strings.TrimSpace(lines[i-1]))
 			}
+		}
+		if m.Version == 1 && triggers == 0 {
+			t.Fatal("0001_init declares no triggers; the check would be vacuous")
 		}
 	}
 }
