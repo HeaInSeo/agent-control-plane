@@ -8,7 +8,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -186,24 +185,79 @@ func TestPublicationRequiresALiveAttemptAndWorkspace(t *testing.T) {
 	})
 }
 
-// Finding 4: a canonical path is not a unique directory when symlinks are in
-// play, so two attempts could share one physical tree.
-func TestWorkspacePathResolvesSymlinks(t *testing.T) {
+// Finding 4 (round 6), revisited in round 7: the canonical-path check is
+// lexical, and says so.
+//
+// Resolving symlinks here was tried and reverted. A pure validator that does
+// filesystem I/O answered differently for the same path depending on whether
+// the directory existed yet — accepting a workspace recorded before creation
+// and rejecting the identical one recorded after, which is backwards for an
+// allocator that materialises the clone first — and it put a stat of a
+// possibly-hung mount inside the store's write transaction. This test pins
+// the guarantee that is actually made, and marks the part that is not.
+func TestWorkspacePathGuaranteeIsLexical(t *testing.T) {
 	ctx := context.Background()
 	db := newDB(t)
-	f := seed(t, db, "r6-symlink", state.IntentReadOnly, state.LaneReview)
+	f := seed(t, db, "r6-path", state.IntentReadOnly, state.LaneReview)
 
+	// Lexical aliases are rejected outright.
+	for _, alias := range []string{
+		"/var/lib/acp/ws/.", "/var/lib/acp/ws/", "/var/lib/acp/./ws",
+		"/var/lib/acp/x/../ws", "relative/ws", "",
+	} {
+		ws := f.Workspace
+		ws.WorkspaceID = ids.NewWorkspaceID()
+		ws.RootPath = alias
+		if err := ws.Validate(); !errors.Is(err, domain.ErrInvalidEntity) {
+			t.Fatalf("alias %q accepted: %v", alias, err)
+		}
+	}
+
+	// Validation is pure: the same path validates identically whether or not
+	// the directory exists, and whether or not a parent is a symlink.
 	dir := t.TempDir()
-	real := filepath.Join(dir, "ws-real")
+	real := filepath.Join(dir, "real")
 	if err := os.Mkdir(real, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	link := filepath.Join(dir, "ws-link")
+	link := filepath.Join(dir, "link")
 	if err := os.Symlink(real, link); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 
-	// A successor attempt to own the workspace under test.
+	underLink := filepath.Join(link, "ws-1")
+	ws := f.Workspace
+	ws.WorkspaceID = ids.NewWorkspaceID()
+	ws.RootPath = underLink
+	if err := ws.Validate(); err != nil {
+		t.Fatalf("a canonical path under a symlinked parent was refused before creation: %v", err)
+	}
+	if err := os.Mkdir(underLink, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := ws.Validate(); err != nil {
+		t.Fatalf("the same path was refused after creation: %v", err)
+	}
+
+	// The documented gap: two canonical strings can still name one physical
+	// tree, and the store does not detect it. The workspace allocator that
+	// creates the directory has to. See docs/threat-boundary.md.
+	viaLink := filepath.Join(link, "shared")
+	viaReal := filepath.Join(real, "shared")
+	if viaLink == viaReal {
+		t.Fatal("test is vacuous: the two spellings are identical")
+	}
+	for _, path := range []string{viaLink, viaReal} {
+		probe := f.Workspace
+		probe.WorkspaceID = ids.NewWorkspaceID()
+		probe.RootPath = path
+		if err := probe.Validate(); err != nil {
+			t.Fatalf("expected the lexical check to accept %q (the symlink gap is documented, "+
+				"not enforced here): %v", path, err)
+		}
+	}
+
+	// What the store does enforce: one attempt per stored path.
 	successor := f.Attempt
 	successor.AttemptID = ids.NewAttemptID()
 	successor.FenceEpoch = f.Attempt.FenceEpoch + 1
@@ -216,39 +270,20 @@ func TestWorkspacePathResolvesSymlinks(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create successor: %v", err)
 	}
-
-	ws := f.Workspace
-	ws.WorkspaceID = ids.NewWorkspaceID()
-	ws.AttemptID = successor.AttemptID
-	ws.RootPath = link
-
-	// The symlinked spelling is canonical as a string but names another
-	// directory, so it must be refused with the resolved path named.
-	err := db.Write(ctx, func(tx *store.Tx) error {
-		return tx.CreateWorkspace(ctx, ws)
-	})
-	if !errors.Is(err, domain.ErrInvalidEntity) {
-		t.Fatalf("want ErrInvalidEntity for a symlinked root_path, got %v", err)
-	}
-	if !strings.Contains(err.Error(), real) {
-		t.Fatalf("the error should name the resolved path %q: %v", real, err)
-	}
-
-	// The resolved spelling is accepted.
-	ws.RootPath = real
+	owned := f.Workspace
+	owned.WorkspaceID = ids.NewWorkspaceID()
+	owned.AttemptID = successor.AttemptID
+	owned.RootPath = viaReal
 	if err := db.Write(ctx, func(tx *store.Tx) error {
-		return tx.CreateWorkspace(ctx, ws)
+		return tx.CreateWorkspace(ctx, owned)
 	}); err != nil {
-		t.Fatalf("the resolved path was refused: %v", err)
+		t.Fatalf("create workspace: %v", err)
 	}
-
-	// A path that does not exist yet is still accepted: recording a workspace
-	// before it is materialised is the normal case.
-	pending := f.Workspace
-	pending.WorkspaceID = ids.NewWorkspaceID()
-	pending.AttemptID = successor.AttemptID
-	pending.RootPath = filepath.Join(dir, "not-created-yet")
-	if err := pending.Validate(); err != nil {
-		t.Fatalf("an unmaterialised path was refused: %v", err)
+	if err := db.Write(ctx, func(tx *store.Tx) error {
+		clash := owned
+		clash.WorkspaceID = ids.NewWorkspaceID()
+		return tx.CreateWorkspace(ctx, clash)
+	}); !errors.Is(err, store.ErrWorkspaceConflict) {
+		t.Fatalf("want ErrWorkspaceConflict for a duplicate path, got %v", err)
 	}
 }

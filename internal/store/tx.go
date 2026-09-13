@@ -109,6 +109,21 @@ func (db *DB) nowFunc() func() time.Time {
 	return func() time.Time { return time.Now().UTC() }
 }
 
+// requireNoOpenTransaction rejects a handle-level query issued from inside a
+// transaction on the same goroutine.
+//
+// The nesting guard in runTx covers Write and Read, but the *DB query helpers
+// go straight to the pool, and with a single connection they would wait for
+// the connection the caller's own transaction is holding — the same silent
+// hang, reached by a different door.
+func (db *DB) requireNoOpenTransaction() error {
+	self := goroutineID()
+	if self != 0 && db.txOwner.Load() == self {
+		return fmt.Errorf("%w: use the transaction already in hand", ErrNestedTransaction)
+	}
+	return nil
+}
+
 // goroutineID returns the current goroutine's id, or 0 if it cannot be read.
 //
 // Go does not expose this, and needing it is a smell — but the alternative is

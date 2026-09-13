@@ -328,6 +328,9 @@ func (db *DB) enableWAL(ctx context.Context) error {
 // foreign_keys pragma would not fail anything loudly, it would just stop
 // enforcing every identity relation in the schema.
 func (db *DB) VerifyConnectionPragmas(ctx context.Context) error {
+	if err := db.requireNoOpenTransaction(); err != nil {
+		return err
+	}
 	var fk int
 	if err := db.sql.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&fk); err != nil {
 		return fmt.Errorf("store: read foreign_keys pragma: %w", err)
@@ -361,6 +364,9 @@ func (db *DB) VerifyConnectionPragmas(ctx context.Context) error {
 // IntegrityCheck runs SQLite's integrity check and fails closed on any result
 // other than a single "ok".
 func (db *DB) IntegrityCheck(ctx context.Context) error {
+	if err := db.requireNoOpenTransaction(); err != nil {
+		return err
+	}
 	rows, err := db.sql.QueryContext(ctx, "PRAGMA integrity_check")
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrIntegrityCheckFailed, err)

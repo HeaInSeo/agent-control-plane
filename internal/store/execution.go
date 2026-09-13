@@ -174,6 +174,13 @@ func (t *Tx) SetTaskCurrentAttempt(ctx context.Context, id ids.TaskID, attempt i
 	if err != nil {
 		return err
 	}
+	// Pointing a task at an attempt from a retired generation wedges it: the
+	// attempt holds the repository's modifying slot so no replacement can be
+	// admitted, while evidence against it is refused for the stale epoch, so
+	// nothing can complete either.
+	if err := t.RequireCurrentEpoch(ctx, candidate.SchedulerEpoch); err != nil {
+		return err
+	}
 	if candidate.TaskID != id {
 		return fmt.Errorf("%w: attempt %s belongs to task %s, not %s",
 			ErrInvalidTaskRun, string(attempt), string(candidate.TaskID), string(id))
@@ -502,6 +509,21 @@ func (t *Tx) CreateWorkspace(ctx context.Context, w domain.Workspace) error {
 	}
 	if err := w.Validate(); err != nil {
 		return err
+	}
+	// The same liveness fence publication applies. A workspace row is
+	// undeletable and its root_path is unique, so handing one to a terminal
+	// attempt burns that directory for good on a workspace that can never be
+	// published from and can never complete anything.
+	attempt, err := t.WorkerAttempt(ctx, w.AttemptID)
+	if err != nil {
+		return err
+	}
+	if err := t.RequireCurrentEpoch(ctx, attempt.SchedulerEpoch); err != nil {
+		return err
+	}
+	if attempt.Status.IsTerminal() {
+		return fmt.Errorf("%w: attempt %s is terminal (%s)",
+			ErrWorkspaceConflict, string(w.AttemptID), string(attempt.Status))
 	}
 	if _, err := t.exec(ctx,
 		`INSERT INTO workspace (workspace_id, attempt_id, task_id, repository_subject_id,

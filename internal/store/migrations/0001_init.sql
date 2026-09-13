@@ -44,6 +44,21 @@ BEGIN
     SELECT RAISE(ABORT, 'scheduler ownership epoch must move forward');
 END;
 
+-- Ownership history is append-only. Deleting an epoch, or the ownership row,
+-- would let a retired generation reacquire ownership by re-activating at a
+-- number it already used.
+CREATE TRIGGER trg_scheduler_epoch_no_delete
+BEFORE DELETE ON scheduler_epoch
+BEGIN
+    SELECT RAISE(ABORT, 'scheduler epochs are durable and cannot be deleted');
+END;
+
+CREATE TRIGGER trg_scheduler_ownership_no_delete
+BEFORE DELETE ON scheduler_ownership
+BEGIN
+    SELECT RAISE(ABORT, 'scheduler ownership cannot be deleted');
+END;
+
 CREATE TRIGGER trg_scheduler_epoch_monotonic
 BEFORE INSERT ON scheduler_epoch
 FOR EACH ROW
@@ -70,6 +85,15 @@ CREATE TABLE repository_subject (
 
 CREATE INDEX ix_repository_subject_full_name
     ON repository_subject (current_full_name);
+
+-- A subject is never deleted: dropping an unreferenced one and re-inserting
+-- it would mint a new repository_subject_id for the same github_node_id,
+-- which is precisely the identity fork CC5 exists to prevent.
+CREATE TRIGGER trg_repository_subject_no_delete
+BEFORE DELETE ON repository_subject
+BEGIN
+    SELECT RAISE(ABORT, 'repository subjects are durable and cannot be deleted');
+END;
 
 -- The stable identity of a subject never changes once observed.
 CREATE TRIGGER trg_repository_subject_node_id_immutable
@@ -235,6 +259,37 @@ WHEN NEW.completed_evidence_id IS NOT NULL
   AND (SELECT task_id FROM evidence_observation WHERE evidence_id = NEW.completed_evidence_id) IS NOT NEW.task_id
 BEGIN
     SELECT RAISE(ABORT, 'completion evidence must be attributed to this task');
+END;
+
+-- A task's identity is fixed at creation. task_run was the only durable
+-- entity without this, and the coherence trigger above fires on INSERT only,
+-- so the packet a task was approved against could be swapped afterwards —
+-- re-authorising the task under a different, possibly wider scope while the
+-- packet it was actually approved against sat marked STALE. `intent` matters
+-- just as much: it is what selects the evidence contract at completion.
+--
+-- Only status, current_attempt_id, completed_evidence_id and updated_at move.
+CREATE TRIGGER trg_task_run_identity_immutable
+BEFORE UPDATE ON task_run
+FOR EACH ROW
+WHEN NEW.task_id               IS NOT OLD.task_id
+  OR NEW.repository_subject_id IS NOT OLD.repository_subject_id
+  OR NEW.packet_id             IS NOT OLD.packet_id
+  OR NEW.lane                  IS NOT OLD.lane
+  OR NEW.intent                IS NOT OLD.intent
+  OR NEW.created_at            IS NOT OLD.created_at
+BEGIN
+    SELECT RAISE(ABORT, 'task_run identity is immutable');
+END;
+
+-- Durable execution records are never deleted. Without this a terminal task
+-- could be resurrected by DELETE followed by INSERT with the same task_id,
+-- defeating the status-transition rule by the same route the packet no-delete
+-- trigger exists to block.
+CREATE TRIGGER trg_task_run_no_delete
+BEFORE DELETE ON task_run
+BEGIN
+    SELECT RAISE(ABORT, 'task runs are durable and cannot be deleted');
 END;
 
 -- Permitted task status transitions only. READY, RUNNING and BLOCKED_DESIGN

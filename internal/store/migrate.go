@@ -115,6 +115,9 @@ func parseMigrationName(filename string) (int, string, error) {
 // consistency check. Anything unexpected stops the process rather than
 // attempting a repair.
 func (db *DB) Migrate(ctx context.Context, set []Migration) error {
+	if err := db.requireNoOpenTransaction(); err != nil {
+		return err
+	}
 	if db.mode == ModeReadOnly {
 		return fmt.Errorf("%w: cannot migrate", ErrReadOnly)
 	}
@@ -175,6 +178,9 @@ const dbContract = "v0.1"
 //
 // bootstrap is idempotent, so a retry after any crash is safe.
 func (db *DB) bootstrap(ctx context.Context) error {
+	if err := db.requireNoOpenTransaction(); err != nil {
+		return err
+	}
 	if db.mode == ModeReadOnly {
 		return fmt.Errorf("%w: cannot bootstrap", ErrReadOnly)
 	}
@@ -232,6 +238,9 @@ CREATE TABLE IF NOT EXISTS schema_migration (
 // history; that is reported as an empty history rather than an error, so an
 // inspector can look at a fresh or half-bootstrapped file without failing.
 func (db *DB) AppliedMigrations(ctx context.Context) ([]AppliedMigration, error) {
+	if err := db.requireNoOpenTransaction(); err != nil {
+		return nil, err
+	}
 	hasLedger, err := db.tableExists(ctx, "schema_migration")
 	if err != nil {
 		return nil, err
@@ -271,6 +280,9 @@ func (db *DB) AppliedMigrations(ctx context.Context) ([]AppliedMigration, error)
 
 // tableExists reports whether a non-internal table is present.
 func (db *DB) tableExists(ctx context.Context, name string) (bool, error) {
+	if err := db.requireNoOpenTransaction(); err != nil {
+		return false, err
+	}
 	var n int
 	if err := db.sql.QueryRowContext(ctx,
 		`SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = ?`, name,

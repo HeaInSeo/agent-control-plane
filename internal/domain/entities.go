@@ -3,7 +3,6 @@ package domain
 import (
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -228,25 +227,29 @@ func (k IsolationKind) Validate() error {
 	}
 }
 
-// validateWorkspacePath requires an absolute, already-canonical path, and
-// resolves symlinks where the path exists.
+// validateWorkspacePath requires an absolute, already-canonical path.
 //
 // The schema's UNIQUE(root_path) is the filesystem half of the isolation
 // invariant, but uniqueness of a string is weaker than uniqueness of a
-// directory. Two problems, with different strengths of answer:
+// directory, and it is worth being exact about how much weaker.
 //
-// Lexical aliases — "/a/ws", "/a/ws/", "/a/./ws", "/a/b/../ws" and a relative
-// "ws" — are five strings naming at most one directory. Requiring an absolute
-// Clean-stable form rules these out completely.
+// Lexical aliases are ruled out completely: "/a/ws", "/a/ws/", "/a/./ws",
+// "/a/b/../ws" and a relative "ws" are five strings naming at most one
+// directory, and requiring an absolute Clean-stable form rejects four of them.
 //
-// Symlinks are only partly ruled out. If /srv/ws-a links to /srv/ws-b, then
-// /srv/ws-a/t1 and /srv/ws-b/t1 are both canonical strings naming one
-// physical tree, and two attempts pointed at them would share a working
-// directory — the sharing CC3 forbids. Where the path already exists it is
-// resolved and rejected if it is not its own resolution. Where it does not
-// exist yet there is nothing to resolve, so the guarantee is lexical only,
-// and the workspace allocator that actually creates the directory must
-// re-check after creating it.
+// Symlinks are not. If /srv/ws-a links to /srv/ws-b then /srv/ws-a/t1 and
+// /srv/ws-b/t1 are both canonical strings naming one physical tree, and the
+// constraint would not notice. Resolving them here was tried and reverted:
+// this is a pure validator, and giving it filesystem I/O made it answer
+// differently for the same path depending on whether the directory existed
+// yet — accepting a workspace recorded before creation and rejecting the
+// identical one recorded after, which is backwards for an allocator that
+// materialises the clone first. It also put a stat of a possibly-hung mount
+// inside the store's write transaction, behind the single connection.
+//
+// So the guarantee here is lexical, deliberately, and resolving symlinks
+// belongs to the workspace allocator that actually creates the directory and
+// can check the real filesystem once. See docs/threat-boundary.md.
 func validateWorkspacePath(path string) error {
 	if path == "" {
 		return fmt.Errorf("%w: root_path is empty", ErrInvalidEntity)
@@ -256,19 +259,6 @@ func validateWorkspacePath(path string) error {
 	}
 	if cleaned := filepath.Clean(path); cleaned != path {
 		return fmt.Errorf("%w: root_path %q is not canonical (want %q)", ErrInvalidEntity, path, cleaned)
-	}
-	resolved, err := filepath.EvalSymlinks(path)
-	if errors.Is(err, os.ErrNotExist) {
-		// The directory has not been created yet, which is the normal case
-		// when a workspace is recorded before it is materialised.
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("%w: root_path %q could not be resolved: %w", ErrInvalidEntity, path, err)
-	}
-	if resolved != path {
-		return fmt.Errorf("%w: root_path %q resolves to %q; use the resolved path so that "+
-			"two workspaces cannot name one directory", ErrInvalidEntity, path, resolved)
 	}
 	return nil
 }

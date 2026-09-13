@@ -227,10 +227,13 @@ Defences in M0:
   idempotent and never adopts a file whose marker names another owner.
 - Each migration and its ledger entry share one transaction, so a failed step
   leaves neither its schema changes nor a record claiming it succeeded.
-- Event history rejects `UPDATE` and `DELETE`, and every other durable
-  execution record — packets, attempts, workspaces, publications, evidence —
-  rejects `DELETE`, so a row cannot be dropped and re-inserted under the same
-  identity with different content.
+- Event history rejects `UPDATE` and `DELETE`, and every other durable record
+  — packets, tasks, attempts, workspaces, publications, evidence, repository
+  subjects, scheduler epochs and the ownership row — rejects `DELETE`, so a
+  row cannot be dropped and re-inserted under the same identity with different
+  content. A task's packet, intent, lane and repository subject are frozen at
+  creation for the same reason: swapping the packet would re-authorise the
+  task under a scope it was never approved for.
 
 ## Secrets in history
 
@@ -288,7 +291,7 @@ no key to match on.
 | Gap | Required before |
 | --- | --- |
 | A completed task still holds its repository's modifying slot — escalated, see below | resolution before M1 admission |
-| Workspace symlink resolution for a path that does not exist yet | the workspace allocator (M2) |
+| Workspace symlink resolution — the stored-path guarantee is lexical only | the workspace allocator (M2) |
 | OS-level worker isolation and credential fence | first real worker (M2) |
 | Worker push-isolation test | first real worker (M2) |
 | Publisher with exact-SHA enforcement | first remote mutation (M3) |

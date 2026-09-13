@@ -110,8 +110,11 @@ resolves the existing intent by its idempotency key and re-runs the gate, and
 an `APPLIED` or `OBSERVED` intent means the remote mutation already happened.
 Resolving an `UNKNOWN` outcome is reconciliation, not re-publication.
 
-Recording a publication applies the same liveness fence as completion: a
-terminal attempt or a released workspace cannot mint one. Publication rows are
+Creating a workspace and recording a publication both apply the same liveness
+fence as completion: a terminal attempt cannot be given a workspace, and a
+terminal attempt or released workspace cannot mint a publication. A workspace
+row is undeletable and its `root_path` is unique, so handing one to a dead
+attempt burns that directory permanently. Publication rows are
 undeletable and immutable except for status, so an intent minted by a
 fenced-out attempt would sit in the pending queue for ever, resolvable only to
 `REJECTED`.
@@ -149,12 +152,19 @@ not uniqueness of a directory: `/a/ws`, `/a/ws/`, `/a/./ws`, `/a/b/../ws` and a
 relative `ws` are five distinct strings naming at most one directory, so
 without canonicalisation the constraint would not mean what it says.
 
-Symlinks are only partly covered, and the distinction is worth stating plainly
-rather than claiming more than holds. Where the path already exists it is
-resolved and rejected if it is not its own resolution. Where it does not exist
-yet — the normal case, since M0 records a workspace without creating it —
-there is nothing to resolve, so the guarantee is lexical, and the allocator
-that materialises the directory must re-check afterwards.
+Symlinks are not covered, and the distinction is worth stating plainly rather
+than claiming more than holds: `/srv/ws-a/t1` and `/srv/ws-b/t1` are both
+canonical strings naming one physical tree if `ws-a` links to `ws-b`.
+
+Resolving them in the validator was tried and reverted. A pure validator that
+does filesystem I/O answers differently for the same path depending on whether
+the directory exists yet — accepting a workspace recorded before creation and
+rejecting the identical one recorded after, which is backwards for an
+allocator that materialises the clone first — and it puts a stat of a
+possibly-hung mount inside the write transaction, behind the single
+connection. So the guarantee here is lexical, deliberately, and resolving
+symlinks belongs to the workspace allocator that creates the directory and can
+check the real filesystem once.
 
 ### CC4 — SchedulerEpoch
 
@@ -264,10 +274,20 @@ a new approval is a new packet. Both the Go guard
 schema trigger enforce this. Deletion is refused too: a packet no task
 references yet could otherwise be dropped and re-inserted under the same
 identity with a widened scope, which is a content change by another route.
-The same no-delete rule covers `worker_attempt`, `workspace`,
-`publish_attempt`, `evidence_observation` and `event` — every durable
-execution record — since immutability that stops at `UPDATE` is not
-immutability.
+The same no-delete rule covers every durable record: `task_run`,
+`worker_attempt`, `workspace`, `publish_attempt`, `evidence_observation`,
+`event`, `repository_subject`, `scheduler_epoch` and `scheduler_ownership`.
+Immutability that stops at `UPDATE` is not immutability — a terminal task
+could be resurrected, or a repository subject re-minted under a new
+identifier, by dropping the row and inserting it again.
+
+Identity immutability covers the same set. `task_run` in particular freezes
+`packet_id`, `intent`, `lane` and `repository_subject_id`: the coherence
+trigger fires on INSERT only, so without it the packet a task was approved
+against could be swapped afterwards, re-authorising the task under a wider
+scope while the packet it was actually approved against sat marked `STALE`.
+`intent` matters as much, since it selects the evidence contract at
+completion.
 
 `WorkerAttemptStatus` has the same shape of rule. Live states move forward
 only, and a terminal state is final:
@@ -395,6 +415,12 @@ are told apart by which goroutine holds the lock, and a nested call returns
 `ErrNestedTransaction` immediately instead of deadlocking. A per-handle flag
 would have been simpler and wrong: it rejects legitimate concurrency as if it
 were nesting.
+
+The handle-level queries — `SchemaVersion`, `VerifySchema`,
+`AppliedMigrations`, `IntegrityCheck`, `VerifyConnectionPragmas`, `Migrate` —
+carry the same guard. They go straight to the pool rather than through a
+transaction, so without it they would reach the identical hang by a different
+door.
 
 `Read` runs a genuinely read-only transaction: the driver treats
 `sql.TxOptions.ReadOnly` as a hint about which `BEGIN` to issue and enforces
