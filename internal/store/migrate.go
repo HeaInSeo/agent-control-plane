@@ -365,6 +365,37 @@ func (db *DB) applyMigration(ctx context.Context, m Migration) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Re-read the ledger inside the transaction. The version check that got
+	// us here ran outside it, so two processes starting together both see an
+	// unmigrated database — nothing fences them, since the epoch fence only
+	// begins at ActivateScheduler — and the loser's DDL would fail with an
+	// opaque "table already exists" after waiting out the winner's commit.
+	// BEGIN IMMEDIATE makes this check-then-write atomic.
+	var (
+		recordedName     string
+		recordedChecksum string
+	)
+	err = tx.QueryRowContext(ctx,
+		`SELECT name, checksum FROM schema_migration WHERE version = ?`, m.Version,
+	).Scan(&recordedName, &recordedChecksum)
+	switch {
+	case err == nil:
+		// Someone else applied it first. That is a success, provided it is
+		// the same migration: a different name or checksum means the applied
+		// schema and this build have diverged, which must still fail closed.
+		if recordedName != m.Name {
+			return fmt.Errorf("%w: version %d is recorded as %q, this build has %q",
+				ErrMigrationHistoryDivergent, m.Version, recordedName, m.Name)
+		}
+		if recordedChecksum != m.Checksum() {
+			return fmt.Errorf("%w: version %d recorded %s, embedded %s",
+				ErrMigrationChecksumMismatch, m.Version, recordedChecksum, m.Checksum())
+		}
+		return nil
+	case !errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("read ledger: %w", err)
+	}
+
 	if _, err := tx.ExecContext(ctx, m.SQL); err != nil {
 		return fmt.Errorf("exec: %w", err)
 	}

@@ -187,6 +187,12 @@ func (t *Tx) SetTaskRunStatus(ctx context.Context, id ids.TaskID, status state.T
 		return fmt.Errorf("%w: task %s cannot move from %q to %q",
 			ErrForbiddenTaskTransition, string(id), string(current.Status), string(status))
 	}
+	// Re-asserting the current status is a no-op, not a move. Without this a
+	// long-finished task could be rewritten to look freshly touched — the one
+	// durable write that would still accept a task everything else refuses.
+	if status == current.Status {
+		return nil
+	}
 	return t.exactlyOne(ctx, "task run", string(id),
 		`UPDATE task_run SET status = ?, updated_at = ? WHERE task_id = ?`,
 		string(status), formatTime(t.Now()), string(id))
@@ -531,6 +537,12 @@ func (t *Tx) SetWorkerAttemptStatus(ctx context.Context, id ids.AttemptID, statu
 	if !current.Status.CanTransitionTo(status) {
 		return fmt.Errorf("%w: attempt %s cannot move from %q to %q",
 			ErrForbiddenAttemptTransition, string(id), string(current.Status), string(status))
+	}
+	// Re-asserting the current status is a no-op, as for publications and
+	// tasks: a recovery or reconciler loop must not make updated_at stop
+	// identifying when the attempt actually last changed.
+	if status == current.Status {
+		return nil
 	}
 	return t.exactlyOne(ctx, "worker attempt", string(id),
 		`UPDATE worker_attempt SET status = ?, updated_at = ? WHERE attempt_id = ?`,

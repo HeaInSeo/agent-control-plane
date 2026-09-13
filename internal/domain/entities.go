@@ -143,6 +143,11 @@ func (t TaskRun) Validate() error {
 			return fmt.Errorf("%w: current_attempt_id: %w", ErrInvalidEntity, err)
 		}
 	}
+	if t.CompletedEvidenceID != nil {
+		if err := t.CompletedEvidenceID.Validate(); err != nil {
+			return fmt.Errorf("%w: completed_evidence_id: %w", ErrInvalidEntity, err)
+		}
+	}
 	if t.Status == state.TaskCompleted && t.CompletedEvidenceID == nil {
 		return fmt.Errorf("%w: COMPLETED requires completed_evidence_id (worker exit is not completion)", ErrInvalidEntity)
 	}

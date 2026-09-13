@@ -2,6 +2,7 @@ package domain_test
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -34,7 +35,9 @@ func TestRedactFields(t *testing.T) {
 			t.Fatalf("%q survived redaction as %v", key, out[key])
 		}
 	}
-	if out["repository"] != "HeaInSeo/agent-control-plane" || out["attempt"] != 7 {
+	// Values come back JSON-normalised, so the number is compared by its
+	// literal rather than its Go type.
+	if out["repository"] != "HeaInSeo/agent-control-plane" || fmt.Sprint(out["attempt"]) != "7" {
 		t.Fatalf("non-sensitive fields were altered: %v", out)
 	}
 	nested, ok := out["nested"].(map[string]any)
@@ -312,5 +315,44 @@ func TestRedactionSplitsAcronymBoundaries(t *testing.T) {
 		if out[key] != "keep-me" {
 			t.Fatalf("ordinary field %q was destroyed", key)
 		}
+	}
+}
+
+// Finding 13.4: the exported redaction entry point promised replacement but
+// silently passed through any container the internal walk did not name.
+func TestExportedRedactFieldsHandlesUnnormalisedShapes(t *testing.T) {
+	type creds struct {
+		Token string `json:"github_token"`
+		Lane  string `json:"lane"`
+	}
+	out := domain.RedactFields(map[string]any{
+		"headers":     map[string]string{"authorization": "Bearer fake-not-a-real-secret"},
+		"argv":        []string{"--lane", "operator"},
+		"structured":  creds{Token: "fake-not-a-real-secret", Lane: "review"},
+		"list_of_map": []map[string]string{{"api_key": "fake-not-a-real-secret"}},
+		"lane":        "operator",
+	})
+
+	encoded, err := domain.EncodeFields(out)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if strings.Contains(encoded, "fake-not-a-real-secret") {
+		t.Fatalf("a credential survived RedactFields: %s", encoded)
+	}
+
+	headers := out["headers"].(map[string]any)
+	if headers["authorization"] != domain.Redacted {
+		t.Fatalf("map[string]string value was not redacted: %v", headers)
+	}
+	structured := out["structured"].(map[string]any)
+	if structured["github_token"] != domain.Redacted {
+		t.Fatalf("struct field was not redacted: %v", structured)
+	}
+	if structured["lane"] != "review" {
+		t.Fatalf("non-sensitive struct field was altered: %v", structured["lane"])
+	}
+	if out["lane"] != "operator" {
+		t.Fatalf("non-sensitive scalar was altered: %v", out["lane"])
 	}
 }

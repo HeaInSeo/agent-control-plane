@@ -42,25 +42,18 @@ func TestTerminalTaskFenceIsEnforcedBySchema(t *testing.T) {
 	db := newDB(t)
 	f := seed(t, db, "r10-schema-fence", state.IntentModifying, state.LaneOperator)
 
-	// A second live attempt, so the workspace insert below is refused for the
-	// task's sake rather than the attempt's.
-	successor := f.Attempt
-	successor.AttemptID = ids.NewAttemptID()
-	successor.FenceEpoch = f.Attempt.FenceEpoch + 1
-	successor.Status = state.AttemptRunning
-	if err := db.Write(ctx, func(tx *store.Tx) error {
-		// Free the repository's modifying slot before admitting the successor.
-		if err := tx.SetWorkerAttemptStatus(ctx, f.Attempt.AttemptID, state.AttemptFailed); err != nil {
-			return err
+	// A read-only fixture on its own repository subject supplies a live
+	// attempt that owns no workspace yet, so the workspace insert below is
+	// refused for the task's sake rather than the attempt's or a duplicate
+	// path. f's own attempt stays live for the same reason.
+	spare := seedAttemptWithoutWorkspace(t, db, "r10-schema-spare")
+
+	for _, task := range []ids.TaskID{f.Task.TaskID, spare.Task.TaskID} {
+		if err := db.Write(ctx, func(tx *store.Tx) error {
+			return tx.SetTaskRunStatus(ctx, task, state.TaskAbandoned)
+		}); err != nil {
+			t.Fatalf("abandon %s: %v", string(task), err)
 		}
-		return tx.CreateWorkerAttempt(ctx, successor)
-	}); err != nil {
-		t.Fatalf("create successor: %v", err)
-	}
-	if err := db.Write(ctx, func(tx *store.Tx) error {
-		return tx.SetTaskRunStatus(ctx, f.Task.TaskID, state.TaskAbandoned)
-	}); err != nil {
-		t.Fatalf("abandon: %v", err)
 	}
 
 	commit := string(sha("r10-schema-commit"))
@@ -96,10 +89,11 @@ func TestTerminalTaskFenceIsEnforcedBySchema(t *testing.T) {
 			return tx.ExecForTest(ctx,
 				`INSERT INTO workspace (workspace_id, attempt_id, task_id, repository_subject_id,
 				                        base_sha, isolation_kind, root_path, created_at, released_at)
-				 VALUES (?, ?, ?, ?, ?, 'ISOLATED_CLONE', '/var/lib/acp/workspaces/r10-raw',
+				 VALUES (?, ?, ?, ?, ?, 'READ_ONLY_CHECKOUT', '/var/lib/acp/workspaces/r10-raw',
 				         '2026-09-12T09:00:00.000000000Z', NULL)`,
-				string(ids.NewWorkspaceID()), string(successor.AttemptID), string(f.Task.TaskID),
-				string(f.Subject.RepositorySubjectID), string(f.Workspace.BaseSHA))
+				string(ids.NewWorkspaceID()), string(spare.Attempt.AttemptID),
+				string(spare.Task.TaskID), string(spare.Subject.RepositorySubjectID),
+				string(f.Workspace.BaseSHA))
 		},
 	}
 

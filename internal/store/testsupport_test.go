@@ -296,3 +296,64 @@ func fixtureForPreconditions() preconditionFixture {
 		},
 	}
 }
+
+// seedAttemptWithoutWorkspace builds a read-only task on its own repository
+// subject with a live attempt that owns no workspace yet.
+//
+// Useful where a test needs to exercise workspace creation without tripping
+// the per-attempt workspace uniqueness or the per-repository modifying slot.
+func seedAttemptWithoutWorkspace(t *testing.T, db *store.DB, name string) fixture {
+	t.Helper()
+	ctx := context.Background()
+
+	epoch, err := db.CurrentEpoch(ctx)
+	if err != nil {
+		t.Fatalf("current epoch: %v", err)
+	}
+
+	f := fixture{Epoch: epoch, Subject: newSubject(name)}
+	taskID := ids.NewTaskID()
+	f.Packet = newPacket(taskID, f.Subject.RepositorySubjectID, state.IntentReadOnly, state.LaneReview)
+	f.Task = domain.TaskRun{
+		TaskID:              taskID,
+		RepositorySubjectID: f.Subject.RepositorySubjectID,
+		PacketID:            f.Packet.PacketID,
+		Lane:                state.LaneReview,
+		Intent:              state.IntentReadOnly,
+		Status:              state.TaskReady,
+		CreatedAt:           fixedNow,
+		UpdatedAt:           fixedNow,
+	}
+	f.Attempt = domain.WorkerAttempt{
+		AttemptID:           ids.NewAttemptID(),
+		TaskID:              taskID,
+		PacketID:            f.Packet.PacketID,
+		RepositorySubjectID: f.Subject.RepositorySubjectID,
+		Lane:                state.LaneReview,
+		Intent:              state.IntentReadOnly,
+		SchedulerEpoch:      epoch,
+		FenceEpoch:          1,
+		Status:              state.AttemptRunning,
+		CreatedAt:           fixedNow,
+		UpdatedAt:           fixedNow,
+	}
+
+	if err := db.Write(ctx, func(tx *store.Tx) error {
+		if _, err := tx.ObserveRepositorySubject(ctx, f.Subject); err != nil {
+			return err
+		}
+		if err := tx.ApprovePacket(ctx, f.Packet); err != nil {
+			return err
+		}
+		if err := tx.CreateTaskRun(ctx, f.Task); err != nil {
+			return err
+		}
+		if err := tx.CreateWorkerAttempt(ctx, f.Attempt); err != nil {
+			return err
+		}
+		return tx.SetTaskCurrentAttempt(ctx, f.Task.TaskID, f.Attempt.AttemptID)
+	}); err != nil {
+		t.Fatalf("seed %s: %v", name, err)
+	}
+	return f
+}

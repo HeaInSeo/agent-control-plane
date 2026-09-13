@@ -152,6 +152,12 @@ var sensitiveTokens = []string{
 
 // RedactFields returns a copy of in with sensitive values replaced.
 //
+// Values come back in their JSON-normalised form — numbers as json.Number,
+// structs and typed maps as plain maps — because redaction has to see the
+// shape that will actually be stored. Returning the caller's original types
+// would mean not descending into them, which is precisely how a nested
+// map[string]string or a struct field would keep its credential.
+//
 // Redaction is applied by the store on every append, so an event that reaches
 // durable history cannot carry a credential even if a caller passes one.
 //
@@ -166,6 +172,22 @@ func RedactFields(in map[string]any) map[string]any {
 	if len(in) == 0 {
 		return nil
 	}
+	// Normalise first, so the exported contract holds for any value shape.
+	// The walk below understands only the shapes JSON decoding produces, so
+	// without this a nested map[string]string or a struct would be returned
+	// verbatim — and a caller reading this function's documentation would
+	// reasonably expect its bearer token to have been replaced.
+	if normalised, err := normaliseFields(in); err == nil {
+		in = normalised
+	}
+	// A normalisation failure (a cyclic value) falls through to the direct
+	// walk, which is depth-bounded and still redacts every JSON-shaped
+	// container it meets. EncodeFields reports the cycle as an error.
+	return redactNormalised(in)
+}
+
+// redactNormalised walks values already reduced to JSON shapes.
+func redactNormalised(in map[string]any) map[string]any {
 	out := make(map[string]any, len(in))
 	for k, v := range in {
 		if isSensitiveKey(k) {
@@ -308,8 +330,8 @@ func EncodeFields(in map[string]any) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	redacted := RedactFields(normalised)
-	if redacted == nil {
+	redacted := redactNormalised(normalised)
+	if len(redacted) == 0 {
 		return "{}", nil
 	}
 	b, err := json.Marshal(redacted)

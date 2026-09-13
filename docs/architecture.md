@@ -116,7 +116,8 @@ the same liveness fence as completion, on both the attempt and the task: a
 terminal attempt, a released workspace or a finished task cannot be given a
 workspace, mint a publication, or have an observation filed against it.
 
-All three fences are enforced in the schema as well as in Go — a
+All of these fences — terminal task, terminal attempt and released workspace
+— are enforced in the schema as well as in Go — a
 `BEFORE INSERT` trigger on `workspace`, `publish_attempt` and
 `evidence_observation` — because this file's premise is that a future code
 path cannot bypass an invariant by forgetting a check.
@@ -141,11 +142,12 @@ fenced-out attempt would sit in the pending queue for ever, resolvable only to
 `REJECTED`.
 
 A publication also records when its status last moved, and each transition
-appends an event. Re-asserting the status a publication already has is a
-no-op: both the crash-recovery flow and a periodic reconciler re-assert, and
-treating that as a move would rewrite `updated_at` — which means "when the
-status last moved" — and append a phantom transition per cycle to a table
-nothing can prune. A `PENDING` intent has by definition never moved, so its
+appends an event. Re-asserting a status is a no-op everywhere it can be
+re-asserted — publications, attempts and tasks alike. Both the crash-recovery
+flow and a periodic reconciler re-assert, and treating that as a move would
+rewrite `updated_at` — which means "when the status last moved" — append a
+phantom transition per cycle to a table nothing can prune, and let a
+long-withdrawn task be made to look freshly touched. A `PENDING` intent has by definition never moved, so its
 `updated_at` always equals its `created_at`. `task_run` carries `updated_at` and `workspace` carries
 `released_at`, so without this the most irreversible entity would have been
 the one recording nothing about when it changed — precisely what a publisher
@@ -511,7 +513,12 @@ fresh, empty control plane — the exact case `AllowCreate` exists to prevent.
 
 Migrations are embedded, forward-only and contiguous from version 1, each
 recorded with a SHA-256 checksum. Replay is idempotent and doubles as a
-consistency check. A database migrated beyond what the running build knows
+consistency check — including under concurrency. Two processes starting
+together both see an unmigrated database, since nothing fences them before
+`ActivateScheduler`, so the applying transaction re-reads the ledger inside
+its own `BEGIN IMMEDIATE` and treats an already-recorded version as success.
+A version recorded under a different name or checksum still fails closed:
+that is divergence, not a race. A database migrated beyond what the running build knows
 fails with `ErrSchemaVersionUnsupported` rather than being treated as close
 enough. Each migration runs inside one transaction together with its own
 ledger entry, so a step can never be recorded as applied when it was not.

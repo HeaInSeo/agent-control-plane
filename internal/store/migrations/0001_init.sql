@@ -583,6 +583,18 @@ BEGIN
     SELECT RAISE(ABORT, 'workspace isolation_kind must match the attempt intent');
 END;
 
+-- A terminal attempt takes on no new durable state either. The Go store
+-- enforces this; the schema must too, on the same premise as the fences
+-- around it.
+CREATE TRIGGER trg_workspace_attempt_live
+BEFORE INSERT ON workspace
+FOR EACH ROW
+WHEN (SELECT status FROM worker_attempt WHERE attempt_id = NEW.attempt_id)
+     IN ('FAILED', 'ABANDONED', 'EVIDENCE_UNKNOWN')
+BEGIN
+    SELECT RAISE(ABORT, 'a terminal attempt cannot take a new workspace');
+END;
+
 CREATE TRIGGER trg_workspace_ownership_immutable
 BEFORE UPDATE ON workspace
 FOR EACH ROW
@@ -737,6 +749,18 @@ BEGIN
     SELECT RAISE(ABORT, 'a released workspace cannot publish');
 END;
 
+-- A terminal attempt takes on no new durable state either. The Go store
+-- enforces this; the schema must too, on the same premise as the fences
+-- around it.
+CREATE TRIGGER trg_publish_attempt_attempt_live
+BEFORE INSERT ON publish_attempt
+FOR EACH ROW
+WHEN (SELECT status FROM worker_attempt WHERE attempt_id = NEW.attempt_id)
+     IN ('FAILED', 'ABANDONED', 'EVIDENCE_UNKNOWN')
+BEGIN
+    SELECT RAISE(ABORT, 'a terminal attempt cannot publish');
+END;
+
 CREATE TRIGGER trg_publish_attempt_identity_immutable
 BEFORE UPDATE ON publish_attempt
 FOR EACH ROW
@@ -851,6 +875,18 @@ FOR EACH ROW
 WHEN (SELECT released_at FROM workspace WHERE workspace_id = NEW.workspace_id) IS NOT NULL
 BEGIN
     SELECT RAISE(ABORT, 'a released workspace cannot record evidence');
+END;
+
+-- A terminal attempt takes on no new durable state either. The Go store
+-- enforces this; the schema must too, on the same premise as the fences
+-- around it.
+CREATE TRIGGER trg_evidence_attempt_live
+BEFORE INSERT ON evidence_observation
+FOR EACH ROW
+WHEN (SELECT status FROM worker_attempt WHERE attempt_id = NEW.attempt_id)
+     IN ('FAILED', 'ABANDONED', 'EVIDENCE_UNKNOWN')
+BEGIN
+    SELECT RAISE(ABORT, 'a terminal attempt cannot record evidence');
 END;
 
 CREATE TRIGGER trg_evidence_immutable
