@@ -15,6 +15,10 @@ import (
 // same idempotency identity already exists.
 var ErrDuplicatePublishIdentity = errors.New("duplicate publish identity")
 
+// ErrEvidenceNotRecordable is returned when an observation cannot be recorded
+// because the attempt or workspace it names is no longer live.
+var ErrEvidenceNotRecordable = errors.New("evidence is not recordable")
+
 // ---------------------------------------------------------------------------
 // PublishAttempt (CC1)
 // ---------------------------------------------------------------------------
@@ -85,6 +89,15 @@ func (t *Tx) RecordPublishAttempt(ctx context.Context, p domain.PublishAttempt) 
 		return fmt.Errorf("%w: workspace %s is released",
 			domain.ErrPublishBindingInvalid, string(p.WorkspaceID))
 	}
+	// Publication is the third moment packet authority has to hold, alongside
+	// admission and launch/resume. Recording an intent mints durable,
+	// authority-bearing state that is undeletable and immutable except for
+	// status, so a packet whose binding was already found not to hold would
+	// otherwise leave a PENDING row in the queue for ever, resolvable only to
+	// REJECTED.
+	if err := t.requirePacketAuthority(ctx, attempt.PacketID); err != nil {
+		return err
+	}
 
 	_, err = t.exec(ctx,
 		`INSERT INTO publish_attempt (publish_attempt_id, task_id, attempt_id,
@@ -154,6 +167,31 @@ func (t *Tx) PublishAttempt(ctx context.Context, id ids.PublishAttemptID) (domai
 // ErrForbiddenPublishTransition is returned when a publication status change
 // is not a permitted transition.
 var ErrForbiddenPublishTransition = errors.New("forbidden publish status transition")
+
+// requirePacketAuthority rejects work authorised by a packet that no longer
+// grants execution.
+//
+// Note the deliberate asymmetry with completion, which does NOT require this.
+// Completion is derived from an effect that was externally observed: if the
+// work landed and a packet went stale afterwards, the change exists in the
+// repository, and refusing to complete would leave the task permanently open
+// while the effect stands. Publication is the opposite case — it creates the
+// effect — so it must not proceed on authority that has lapsed.
+func (t *Tx) requirePacketAuthority(ctx context.Context, id ids.PacketID) error {
+	packet, err := t.Packet(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !packet.Status.GrantsExecutionAuthority() {
+		return fmt.Errorf("%w: packet %s status is %q",
+			domain.ErrPacketNoAuthority, string(id), string(packet.Status))
+	}
+	if !t.Now().Before(packet.ExpiresAt) {
+		return fmt.Errorf("%w: packet %s expired at %s",
+			domain.ErrPacketExpired, string(id), packet.ExpiresAt.UTC())
+	}
+	return nil
+}
 
 // PublishAttemptByIdempotencyKey resolves a publication by its identity.
 //
@@ -264,9 +302,23 @@ func (t *Tx) RecordEvidence(ctx context.Context, e domain.EvidenceObservation) e
 	if err := t.RequireCurrentEpoch(ctx, attempt.SchedulerEpoch); err != nil {
 		return err
 	}
+	// The same liveness fence the sibling writers apply. An observation about
+	// a dead attempt or a released workspace has no consumer: completion
+	// rejects both, and the row is immutable and undeletable, so it would be
+	// a permanent record that can never be acted on. A later milestone that
+	// genuinely needs post-mortem observations should add an explicit path
+	// rather than weaken this one.
+	if attempt.Status.IsTerminal() {
+		return fmt.Errorf("%w: attempt %s is terminal (%s)",
+			ErrEvidenceNotRecordable, string(e.AttemptID), string(attempt.Status))
+	}
 	workspace, err := t.WorkspaceForAttempt(ctx, e.AttemptID)
 	if err != nil {
 		return err
+	}
+	if workspace.ReleasedAt != nil {
+		return fmt.Errorf("%w: workspace %s is released",
+			ErrEvidenceNotRecordable, string(workspace.WorkspaceID))
 	}
 	if err := e.CheckAttribution(domain.AttemptIdentity{
 		AttemptID:           attempt.AttemptID,

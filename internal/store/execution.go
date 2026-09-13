@@ -50,6 +50,13 @@ func (t *Tx) CreateTaskRun(ctx context.Context, run domain.TaskRun) error {
 	if run.Status == state.TaskCompleted {
 		return fmt.Errorf("%w: a task cannot be created already COMPLETED", ErrCompletionNotDerivable)
 	}
+	// Nor in any other terminal state. A task created ABANDONED can never
+	// admit an attempt, can never change status, and can never be deleted —
+	// a row that is dead on arrival and permanent.
+	if run.Status.IsTerminal() {
+		return fmt.Errorf("%w: a task cannot be created already %s",
+			ErrInvalidTaskRun, string(run.Status))
+	}
 	// A task cannot be created already pointing at an attempt: an attempt
 	// references its task, so the task has to exist first. Silently dropping
 	// the field would leave the caller believing it had been stored.

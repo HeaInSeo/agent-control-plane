@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -37,6 +38,9 @@ var (
 	ErrIntegrityCheckFailed = errors.New("database integrity check failed")
 	// ErrReadOnly means a write operation was attempted on a read-only handle.
 	ErrReadOnly = errors.New("database handle is read-only")
+	// ErrUnsupportedContract means the database declares a durable-layout
+	// contract this build does not implement.
+	ErrUnsupportedContract = errors.New("database declares an unsupported contract version")
 )
 
 // sqliteMagic is the 16-byte header every SQLite database file starts with.
@@ -92,6 +96,21 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
+// validate rejects a configuration whose values cannot be expressed faithfully.
+func (c Config) validate() error {
+	if c.Path == "" {
+		return errors.New("store: Config.Path is required")
+	}
+	// SQLite's busy_timeout is in milliseconds, so a sub-millisecond value
+	// truncates to zero — which means "do not wait at all", the opposite of
+	// what a caller asking for a short wait intended.
+	if c.BusyTimeout > 0 && c.BusyTimeout.Milliseconds() == 0 {
+		return fmt.Errorf("store: BusyTimeout %s rounds to 0ms; use at least 1ms or leave it unset",
+			c.BusyTimeout)
+	}
+	return nil
+}
+
 // DB is a handle on the control plane database.
 type DB struct {
 	sql   *sql.DB
@@ -128,8 +147,8 @@ type DB struct {
 // activation transaction (CC4).
 func Open(ctx context.Context, cfg Config) (*DB, error) {
 	cfg = cfg.withDefaults()
-	if cfg.Path == "" {
-		return nil, errors.New("store: Config.Path is required")
+	if err := cfg.validate(); err != nil {
+		return nil, err
 	}
 	// The DSN is a file: URI, and a relative path in one is read as a URI
 	// authority rather than a path — SQLite would reject "file://sub/cp.db"
@@ -426,6 +445,22 @@ func (db *DB) verifyOwnMarker(ctx context.Context) error {
 	case kind != dbKind:
 		return fmt.Errorf("%w: %s declares db_kind %q", ErrForeignDatabase, db.path, kind)
 	}
+
+	// The contract marker is checked, not merely written. Left unread it
+	// would look like a fail-closed guard while being inert: a future build
+	// that bumps dbContract would open an older database without noticing.
+	var contract string
+	err = db.sql.QueryRowContext(ctx,
+		`SELECT value FROM control_plane_meta WHERE key = 'db_contract'`).Scan(&contract)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("%w: %s carries no db_contract marker", ErrUnsupportedContract, db.path)
+	case err != nil:
+		return fmt.Errorf("%w: %s: %w", ErrUnsupportedContract, db.path, err)
+	case contract != dbContract:
+		return fmt.Errorf("%w: %s declares db_contract %q, this build implements %q",
+			ErrUnsupportedContract, db.path, contract, dbContract)
+	}
 	return nil
 }
 
@@ -466,8 +501,19 @@ func inspectFile(path string) (fileState, error) {
 	}
 	defer f.Close()
 
+	// A file too small to hold the header cannot be a database.
+	if info.Size() < int64(len(sqliteMagic)) {
+		return fileAbsent, fmt.Errorf("%w: %s is %d bytes, too small for a database header",
+			ErrNotSQLiteDatabase, path, info.Size())
+	}
 	header := make([]byte, len(sqliteMagic))
-	if _, err := f.Read(header); err != nil {
+	// ReadFull rather than Read: a short read returns n < 16 with a nil
+	// error, leaving the tail of the buffer zeroed, so the magic comparison
+	// would fail and a perfectly good scheduler database would be refused as
+	// "not a SQLite database" — a refusal no retry fixes. Short reads are
+	// rare on local regular files but reachable on network or FUSE-backed
+	// storage and on an interrupted read.
+	if _, err := io.ReadFull(f, header); err != nil {
 		return fileAbsent, fmt.Errorf("%w: %s: %w", ErrNotSQLiteDatabase, path, err)
 	}
 	if string(header) != sqliteMagic {

@@ -212,8 +212,9 @@ Defences in M0:
 
 - A missing database is an error unless creation is explicitly requested.
 - A non-SQLite file is rejected and left untouched.
-- A SQLite file without this control plane's `db_kind` marker is refused, and
-  refused without being touched: every inspection happens before the first
+- A SQLite file without this control plane's `db_kind` marker, or declaring a
+  `db_contract` this build does not implement, is refused — and refused
+  without being touched: every inspection happens before the first
   write pragma, so a mistyped path cannot convert an unrelated service's
   database to WAL on the way to rejecting it.
 - The integrity check runs on open and a failure is terminal.

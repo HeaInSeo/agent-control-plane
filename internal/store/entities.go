@@ -209,6 +209,17 @@ func (t *Tx) ApprovePacket(ctx context.Context, p domain.ExecutionPacket) error 
 	if err := t.RequireOwnership(ctx); err != nil {
 		return err
 	}
+	// An approved packet is recorded as approved. Transitions are one-way
+	// away from authority and packets are undeletable, so a row inserted
+	// already STALE or SUPERSEDED would be a durable "approval" that never
+	// granted anything and can never be corrected.
+	if p.Status == "" {
+		p.Status = state.PacketApproved
+	}
+	if p.Status != state.PacketApproved {
+		return fmt.Errorf("%w: a packet must be recorded as %q, not %q",
+			domain.ErrPacketInvalid, string(state.PacketApproved), string(p.Status))
+	}
 	if err := p.Validate(); err != nil {
 		return err
 	}

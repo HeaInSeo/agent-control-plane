@@ -307,8 +307,20 @@ func (db *DB) ActivateScheduler(ctx context.Context, owner ids.SchedulerOwnerID,
 	if err != nil {
 		return domain.SchedulerEpoch{}, err
 	}
-	// Ownership is recorded only after the activation transaction committed.
-	db.ownerEpoch.Store(int64(activated.Epoch))
+	// Ownership is recorded only after the activation transaction committed,
+	// and only ever upward. Two activations serialise inside the transaction
+	// but land here unordered, so a plain Store could leave the handle
+	// believing it owns an older generation than it does — and every
+	// subsequent write would fail as stale until the process restarted.
+	for {
+		current := db.ownerEpoch.Load()
+		if current >= int64(activated.Epoch) {
+			break
+		}
+		if db.ownerEpoch.CompareAndSwap(current, int64(activated.Epoch)) {
+			break
+		}
+	}
 	return activated, nil
 }
 

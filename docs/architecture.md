@@ -110,11 +110,19 @@ resolves the existing intent by its idempotency key and re-runs the gate, and
 an `APPLIED` or `OBSERVED` intent means the remote mutation already happened.
 Resolving an `UNKNOWN` outcome is reconciliation, not re-publication.
 
-Creating a workspace and recording a publication both apply the same liveness
-fence as completion: a terminal attempt cannot be given a workspace, and a
-terminal attempt or released workspace cannot mint a publication. A workspace
-row is undeletable and its `root_path` is unique, so handing one to a dead
-attempt burns that directory permanently. Publication rows are
+Creating a workspace, recording a publication and recording evidence all apply
+the same liveness fence as completion: a terminal attempt or a released
+workspace cannot be given a workspace, mint a publication, or have an
+observation filed against it. These rows are undeletable and immutable, so
+each one handed to a dead attempt is permanent clutter that nothing can ever
+act on — and a workspace additionally burns its unique `root_path`.
+
+Recording a publication also revalidates packet authority. The asymmetry with
+completion is deliberate: publication *creates* the effect, so it must not
+proceed on authority that has lapsed, while completion rests on an effect that
+was already externally observed. If the work landed and the packet went stale
+afterwards, the change exists in the repository, and refusing to complete
+would leave the task open for ever while the effect stands. Publication rows are
 undeletable and immutable except for status, so an intent minted by a
 fenced-out attempt would sit in the pending queue for ever, resolvable only to
 `REJECTED`.
@@ -332,6 +340,13 @@ would let a publication that actually landed end up permanently recorded as
 unique, so that record could never be corrected. A reconciler that cannot
 confirm an applied publication leaves it `APPLIED`.
 
+An approved packet is likewise always recorded `APPROVED`, since transitions
+run one way away from authority and packets are undeletable: a row inserted
+already `STALE` would be a durable approval that never granted anything and
+could never be corrected. A task cannot be created in any terminal state for
+the same reason — it could then never admit an attempt, never change status
+and never be deleted.
+
 A publication is also always recorded at `PENDING`. The transition rules
 constrain updates, so without that a row could be inserted already `OBSERVED`
 — a durable claim that the effect was independently observed, with no
@@ -383,6 +398,10 @@ transaction.
 
 WAL, a single connection matching the single-active-scheduler model, and
 `BEGIN IMMEDIATE` via `_txlock=immediate`.
+
+The `db_contract` marker is checked on open, not merely written: an unread
+marker looks like a fail-closed guard while being inert, and a future build
+that bumps the contract would open an older database without noticing.
 
 Open also refuses a database whose recorded migration history does not match
 this build's — a newer version, a tampered checksum, or a migration name this
