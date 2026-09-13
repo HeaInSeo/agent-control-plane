@@ -223,6 +223,13 @@ func (t *Tx) ApprovePacket(ctx context.Context, p domain.ExecutionPacket) error 
 	if err := p.Validate(); err != nil {
 		return err
 	}
+	// An already-expired approval is the same uncorrectable dead authority by
+	// another route: Validate only checks expires_at against approved_at, not
+	// against now.
+	if !t.Now().Before(p.ExpiresAt) {
+		return fmt.Errorf("%w: packet %s expires at %s, which has already passed",
+			domain.ErrPacketExpired, string(p.PacketID), p.ExpiresAt.UTC())
+	}
 	allowed, err := domain.EncodeStringList(p.AllowedScope)
 	if err != nil {
 		return fmt.Errorf("encode allowed_scope: %w", err)

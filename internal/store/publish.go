@@ -98,6 +98,12 @@ func (t *Tx) RecordPublishAttempt(ctx context.Context, p domain.PublishAttempt) 
 	if err := t.requirePacketAuthority(ctx, attempt.PacketID); err != nil {
 		return err
 	}
+	// And the task itself must still be live. Publication is the irreversible
+	// step: a cancelled task whose push still went out is the worst outcome
+	// this control plane can produce.
+	if err := t.requireLiveTask(ctx, p.TaskID); err != nil {
+		return err
+	}
 
 	_, err = t.exec(ctx,
 		`INSERT INTO publish_attempt (publish_attempt_id, task_id, attempt_id,
@@ -319,6 +325,9 @@ func (t *Tx) RecordEvidence(ctx context.Context, e domain.EvidenceObservation) e
 	if workspace.ReleasedAt != nil {
 		return fmt.Errorf("%w: workspace %s is released",
 			ErrEvidenceNotRecordable, string(workspace.WorkspaceID))
+	}
+	if err := t.requireLiveTask(ctx, e.TaskID); err != nil {
+		return err
 	}
 	if err := e.CheckAttribution(domain.AttemptIdentity{
 		AttemptID:           attempt.AttemptID,

@@ -612,10 +612,6 @@ CREATE TABLE publish_attempt (
 
     -- "publish branch HEAD" is forbidden; an exact immutable commit is required.
     source_commit_sha     TEXT NOT NULL CHECK (length(source_commit_sha) = 40 AND NOT source_commit_sha GLOB '*[^0-9a-f]*'),
-    -- Fully qualified, non-symbolic ref. Finer-grained ref-name rules live in
-    -- domain.ValidateTargetRef; the column keeps the load-bearing part.
-    -- GLOB rather than LIKE for the symbolic-ref check: SQLite's LIKE is
-    -- case-insensitive, which would reject every refs/heads/... target.
     -- GLOB rather than LIKE for the symbolic-ref check: SQLite's LIKE is
     -- case-insensitive, which would reject every refs/heads/... target. Only
     -- a whole trailing HEAD component is symbolic — a branch such as

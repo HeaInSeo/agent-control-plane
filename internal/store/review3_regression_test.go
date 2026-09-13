@@ -193,8 +193,8 @@ func TestTerminalTaskCannotTakeNewWork(t *testing.T) {
 
 			if err := db.Write(ctx, func(tx *store.Tx) error {
 				return tx.CreateWorkerAttempt(ctx, successor)
-			}); !errors.Is(err, store.ErrInvalidTaskRun) {
-				t.Fatalf("want ErrInvalidTaskRun, got %v", err)
+			}); !errors.Is(err, store.ErrTaskNotLive) {
+				t.Fatalf("want ErrTaskNotLive, got %v", err)
 			}
 
 			// And at schema level.

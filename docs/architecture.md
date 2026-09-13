@@ -97,7 +97,8 @@ target, so "publish branch HEAD" cannot be represented, let alone executed.
 `domain.CheckPublishPreconditions` is the gate the future publisher must pass:
 current epoch, current attempt, matching fence, live attempt, owning workspace,
 unreleased workspace, matching repository subject, commit present in workspace,
-and the packet's authority — status and expiry — still holding. Packet
+the task still being live, and the packet's authority — status and expiry —
+still holding. Packet
 authority is checked at all three moments it matters: `Authorize` at launch and
 resume, `CreateWorkerAttempt` at admission, and these preconditions at
 publication. A packet can go stale, be superseded or expire while an attempt is
@@ -111,9 +112,16 @@ an `APPLIED` or `OBSERVED` intent means the remote mutation already happened.
 Resolving an `UNKNOWN` outcome is reconciliation, not re-publication.
 
 Creating a workspace, recording a publication and recording evidence all apply
-the same liveness fence as completion: a terminal attempt or a released
-workspace cannot be given a workspace, mint a publication, or have an
-observation filed against it. These rows are undeletable and immutable, so
+the same liveness fence as completion, on both the attempt and the task: a
+terminal attempt, a released workspace or a finished task cannot be given a
+workspace, mint a publication, or have an observation filed against it.
+
+The task half matters most for publication. Withdrawing a task leaves its
+attempt live — the current-attempt pointer is frozen when a task goes terminal
+— so nothing else in the chain notices, and publication is the irreversible
+step. A cancelled task whose push still went out is the worst outcome this
+control plane can produce, so `CheckPublishPreconditions` carries the task's
+scheduling state too. These rows are undeletable and immutable, so
 each one handed to a dead attempt is permanent clutter that nothing can ever
 act on — and a workspace additionally burns its unique `root_path`.
 
@@ -340,12 +348,15 @@ would let a publication that actually landed end up permanently recorded as
 unique, so that record could never be corrected. A reconciler that cannot
 confirm an applied publication leaves it `APPLIED`.
 
-An approved packet is likewise always recorded `APPROVED`, since transitions
-run one way away from authority and packets are undeletable: a row inserted
-already `STALE` would be a durable approval that never granted anything and
-could never be corrected. A task cannot be created in any terminal state for
-the same reason — it could then never admit an attempt, never change status
-and never be deleted.
+An approved packet is likewise always recorded `APPROVED` and not already
+expired, since transitions run one way away from authority and packets are
+undeletable: either would be a durable approval that never granted anything
+and could never be corrected. A task cannot be created in any terminal state
+for the same reason — it could then never admit an attempt, never change
+status and never be deleted — nor against a packet that no longer grants
+authority, since `packet_id` is immutable once the task exists. An attempt
+cannot be created terminal either: it could never transition, nothing would
+accept it, and it would already have burned a fence epoch.
 
 A publication is also always recorded at `PENDING`. The transition rules
 constrain updates, so without that a row could be inserted already `OBSERVED`

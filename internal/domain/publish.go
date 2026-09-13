@@ -221,6 +221,12 @@ type PublishPreconditions struct {
 	RepositorySubjectID   ids.RepositorySubjectID
 	CommitInWorkspace     bool
 
+	// TaskStatus is the scheduling state of the task being published for. A
+	// withdrawn task must not have its push go out: nothing else in the gate
+	// notices, because the current-attempt pointer is frozen when a task goes
+	// terminal and withdrawal does not mark the packet stale.
+	TaskStatus state.TaskRunStatus
+
 	// PacketStatus and PacketExpiresAt are the authority the publication is
 	// made under. Packet.Authorize covers launch and resume; publication is
 	// the third moment where authority has to still hold, because a packet
@@ -281,6 +287,13 @@ func CheckPublishPreconditions(p PublishAttempt, live PublishPreconditions) erro
 	if !live.CommitInWorkspace {
 		return fmt.Errorf("%w: source_commit_sha %s is not reachable in workspace %s",
 			ErrPublishBindingInvalid, string(p.SourceCommitSHA), string(p.WorkspaceID))
+	}
+	if err := live.TaskStatus.Validate(); err != nil {
+		return fmt.Errorf("%w: %w", ErrPublishBindingInvalid, err)
+	}
+	if live.TaskStatus.IsTerminal() {
+		return fmt.Errorf("%w: task %s is %s",
+			ErrPublishBindingInvalid, string(p.TaskID), string(live.TaskStatus))
 	}
 	if !live.PacketStatus.GrantsExecutionAuthority() {
 		return fmt.Errorf("%w: packet status is %q",

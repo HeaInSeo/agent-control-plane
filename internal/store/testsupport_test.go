@@ -287,6 +287,7 @@ func fixtureForPreconditions() preconditionFixture {
 			WorkspaceReleased:     false,
 			RepositorySubjectID:   subjectID,
 			CommitInWorkspace:     true,
+			TaskStatus:            state.TaskRunning,
 			PacketStatus:          state.PacketApproved,
 			PacketExpiresAt:       fixedNow.Add(24 * time.Hour),
 			Now:                   fixedNow,

@@ -1107,6 +1107,7 @@ func TestPublishPreconditionsRejectStaleBinding(t *testing.T) {
 		WorkspaceReleased:     false,
 		RepositorySubjectID:   f.Subject.RepositorySubjectID,
 		CommitInWorkspace:     true,
+		TaskStatus:            state.TaskRunning,
 		PacketStatus:          state.PacketApproved,
 		PacketExpiresAt:       f.Packet.ExpiresAt,
 		Now:                   fixedNow,
@@ -1180,9 +1181,19 @@ func TestPublishPreconditionsRejectStaleBinding(t *testing.T) {
 			t.Fatalf("want ErrPacketExpired, got %v", err)
 		}
 	})
+	t.Run("withdrawn task", func(t *testing.T) {
+		for _, status := range []state.TaskRunStatus{state.TaskAbandoned, state.TaskCompleted} {
+			withdrawn := live
+			withdrawn.TaskStatus = status
+			if err := domain.CheckPublishPreconditions(pub, withdrawn); !errors.Is(err, domain.ErrPublishBindingInvalid) {
+				t.Fatalf("%s: want ErrPublishBindingInvalid, got %v", string(status), err)
+			}
+		}
+	})
 	t.Run("packet authority unset fails closed", func(t *testing.T) {
 		for _, mutate := range []func(domain.PublishPreconditions) domain.PublishPreconditions{
 			func(p domain.PublishPreconditions) domain.PublishPreconditions { p.PacketStatus = ""; return p },
+			func(p domain.PublishPreconditions) domain.PublishPreconditions { p.TaskStatus = ""; return p },
 			func(p domain.PublishPreconditions) domain.PublishPreconditions { p.Now = time.Time{}; return p },
 			func(p domain.PublishPreconditions) domain.PublishPreconditions {
 				p.PacketExpiresAt = time.Time{}

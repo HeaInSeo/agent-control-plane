@@ -22,6 +22,28 @@ var ErrInvalidTaskRun = errors.New("invalid task run mutation")
 // permitted transition.
 var ErrForbiddenTaskTransition = errors.New("forbidden task run status transition")
 
+// ErrTaskNotLive is returned when durable state is written for a task that
+// has already finished.
+//
+// A withdrawn or completed task takes on nothing new. Publication is the case
+// that matters most — it is the irreversible step, and a cancelled task whose
+// push still went out is the worst outcome this control plane can produce —
+// but the same holds for workspaces and observations, which are undeletable
+// and would leave permanent state belonging to work that is over.
+var ErrTaskNotLive = errors.New("task is not live")
+
+// requireLiveTask rejects durable writes against a finished task.
+func (t *Tx) requireLiveTask(ctx context.Context, id ids.TaskID) error {
+	run, err := t.TaskRun(ctx, id)
+	if err != nil {
+		return err
+	}
+	if run.Status.IsTerminal() {
+		return fmt.Errorf("%w: task %s is %s", ErrTaskNotLive, string(id), string(run.Status))
+	}
+	return nil
+}
+
 // ErrModifyingSlotBusy is returned when a repository subject already has a
 // live modifying attempt (CC9).
 //
@@ -63,6 +85,12 @@ func (t *Tx) CreateTaskRun(ctx context.Context, run domain.TaskRun) error {
 	if run.CurrentAttemptID != nil {
 		return fmt.Errorf("%w: a task cannot be created with a current attempt; "+
 			"create the attempt and then call SetTaskCurrentAttempt", ErrInvalidTaskRun)
+	}
+	// The packet must still grant authority. packet_id is immutable once the
+	// task exists, so a task bound to a stale or expired packet could never
+	// admit an attempt, never complete, and only ever be abandoned.
+	if err := t.requirePacketAuthority(ctx, run.PacketID); err != nil {
+		return err
 	}
 	now := t.Now()
 	if run.CreatedAt.IsZero() {
@@ -364,13 +392,20 @@ func (t *Tx) CreateWorkerAttempt(ctx context.Context, a domain.WorkerAttempt) er
 	if err := t.RequireCurrentEpoch(ctx, a.SchedulerEpoch); err != nil {
 		return err
 	}
+	// An attempt is created live. A terminal one is dead on arrival and
+	// permanent: it can never transition, nothing will accept it, and it has
+	// already burned a fence epoch for its task.
+	if a.Status.IsTerminal() {
+		return fmt.Errorf("%w: an attempt cannot be created already %s",
+			ErrForbiddenAttemptTransition, string(a.Status))
+	}
 	run, err := t.TaskRun(ctx, a.TaskID)
 	if err != nil {
 		return err
 	}
 	if run.Status.IsTerminal() {
 		return fmt.Errorf("%w: task %s is %s and cannot admit a new attempt",
-			ErrInvalidTaskRun, string(a.TaskID), string(run.Status))
+			ErrTaskNotLive, string(a.TaskID), string(run.Status))
 	}
 	// Admission is the third place packet authority has to hold, alongside
 	// launch/resume and publication. A STALE or SUPERSEDED packet means
@@ -531,6 +566,9 @@ func (t *Tx) CreateWorkspace(ctx context.Context, w domain.Workspace) error {
 	if attempt.Status.IsTerminal() {
 		return fmt.Errorf("%w: attempt %s is terminal (%s)",
 			ErrWorkspaceConflict, string(w.AttemptID), string(attempt.Status))
+	}
+	if err := t.requireLiveTask(ctx, w.TaskID); err != nil {
+		return err
 	}
 	if _, err := t.exec(ctx,
 		`INSERT INTO workspace (workspace_id, attempt_id, task_id, repository_subject_id,

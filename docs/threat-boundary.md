@@ -117,6 +117,10 @@ Defences in M0:
   having happened.
 - A publication is always recorded at `PENDING`, so no row can be inserted
   already claiming an observed effect.
+- A withdrawn task cannot mint a publication, a workspace or an observation.
+  Withdrawal leaves the attempt live, so nothing else in the chain notices —
+  and a cancelled task whose push still went out is the worst outcome this
+  control plane can produce.
 - A withdrawn or completed task cannot be re-admitted, and a terminal task
   cannot take a new attempt or change its current attempt.
 - The default effect rule is exact SHA equality, not ancestor-or-equal.
