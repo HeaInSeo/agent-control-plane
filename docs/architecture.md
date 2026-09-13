@@ -215,6 +215,13 @@ blast-radius guard rather than a security boundary — it bounds the damage of a
 mistake, it does not stop a determined caller naming a bad directory two
 levels down.
 
+Containment is covered: a path nested inside an existing workspace, or
+containing one, is refused. `UNIQUE(root_path)` and canonicalisation only rule
+out two spellings of the same string, and a nested tree means one attempt's
+clone contains another's — visible to its `git status`, publishable by it, and
+destroyed along with it. Unlike symlinks this is detectable purely lexically,
+so it belongs in the store rather than the allocator.
+
 Symlinks are not covered, and the distinction is worth stating plainly rather
 than claiming more than holds: `/srv/ws-a/t1` and `/srv/ws-b/t1` are both
 canonical strings naming one physical tree if `ws-a` links to `ws-b`.
@@ -294,6 +301,11 @@ rebinding `completed_evidence_id` once set, so which observation established
 completion cannot be lost.
 
 Read-only work has its own evidence contract, because it publishes nothing.
+Its `reviewed_sha` must be the workspace's `base_sha` — the commit the review
+actually ran against. Comparing it only with the observed and published SHAs
+compares caller-supplied values with each other, which is the
+self-certification CC7 exists to forbid; the modifying path has the analogous
+binding through `publish_attempt.base_sha = workspace.base_sha`.
 A `READ_ONLY_REVIEW` observation must bind `reviewed_sha` — the fixed commit
 the review was performed against — and `artifact_digest`, the digest of the
 immutable artifact the review produced. `reviewed_sha` must equal both the
@@ -397,6 +409,10 @@ would let a publication that actually landed end up permanently recorded as
 "nothing was published". `REJECTED` is terminal and the idempotency key is
 unique, so that record could never be corrected. A reconciler that cannot
 confirm an applied publication leaves it `APPLIED`.
+
+The approval window is bounded at both ends: an approval dated in the future
+would grant live authority before its own stated start, and packet content is
+immutable and undeletable, so it could only be marked stale, never corrected.
 
 An approved packet is likewise always recorded `APPROVED` and not already
 expired, since transitions run one way away from authority and packets are

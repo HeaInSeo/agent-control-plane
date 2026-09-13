@@ -269,8 +269,7 @@ func TestCompletionRefusalIsTyped(t *testing.T) {
 	db := newDB(t)
 	f := seed(t, db, "r4-typed-refusal", state.IntentReadOnly, state.LaneReview)
 
-	reviewed := sha("r4-typed-reviewed")
-	ev := reviewEvidenceFor(f, reviewed, "r4-typed-artifact")
+	ev := reviewEvidenceFor(f, "r4-typed-artifact")
 	if err := db.Write(ctx, func(tx *store.Tx) error {
 		if err := tx.RecordEvidence(ctx, ev); err != nil {
 			return err

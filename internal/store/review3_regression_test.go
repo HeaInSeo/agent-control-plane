@@ -117,8 +117,7 @@ func TestTaskRunStatusTransitions(t *testing.T) {
 	t.Run("completed task cannot be reopened", func(t *testing.T) {
 		db := newDB(t)
 		f := seed(t, db, "r3-reopen", state.IntentReadOnly, state.LaneReview)
-		reviewed := sha("r3-reopen-reviewed")
-		ev := reviewEvidenceFor(f, reviewed, "r3-reopen-artifact")
+		ev := reviewEvidenceFor(f, "r3-reopen-artifact")
 		if err := db.Write(ctx, func(tx *store.Tx) error {
 			if err := tx.RecordEvidence(ctx, ev); err != nil {
 				return err

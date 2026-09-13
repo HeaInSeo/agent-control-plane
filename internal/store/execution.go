@@ -57,6 +57,29 @@ var ErrModifyingSlotBusy = errors.New("repository already has a live modifying a
 // existing one, or is incoherent with the attempt that would own it.
 var ErrWorkspaceConflict = errors.New("workspace conflicts with an existing workspace")
 
+// requireUnnestedWorkspacePath rejects a path that contains, or is contained
+// by, an existing workspace.
+//
+// Checked here as well as by trigger so the refusal is typed. The comparison
+// is exact-string on the "<path>/" prefix rather than a pattern match,
+// because a legitimate path may contain GLOB or LIKE metacharacters.
+func (t *Tx) requireUnnestedWorkspacePath(ctx context.Context, path string) error {
+	var existing string
+	err := t.tx.QueryRowContext(ctx,
+		`SELECT root_path FROM workspace
+		  WHERE substr(?, 1, length(root_path) + 1) = root_path || '/'
+		     OR substr(root_path, 1, length(?) + 1) = ? || '/'
+		  LIMIT 1`, path, path, path).Scan(&existing)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("check workspace nesting: %w", err)
+	}
+	return fmt.Errorf("%w: %s nests with existing workspace %s",
+		ErrWorkspaceConflict, path, existing)
+}
+
 // isolationFor reports the isolation kind an attempt of this intent requires.
 //
 // CC3's rule is a fresh isolated clone per modifying attempt, so the kind
@@ -633,6 +656,9 @@ func (t *Tx) CreateWorkspace(ctx context.Context, w domain.Workspace) error {
 			ErrWorkspaceConflict, string(w.AttemptID), string(attempt.Status))
 	}
 	if err := t.requireLiveTask(ctx, w.TaskID); err != nil {
+		return err
+	}
+	if err := t.requireUnnestedWorkspacePath(ctx, w.RootPath); err != nil {
 		return err
 	}
 	if _, err := t.exec(ctx,

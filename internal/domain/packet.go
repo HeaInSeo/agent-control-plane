@@ -184,6 +184,10 @@ func (p ExecutionPacket) Authorize(now time.Time, observed SourceBinding) error 
 	if now.IsZero() {
 		return fmt.Errorf("%w: authorization time is unset", ErrPacketInvalid)
 	}
+	if now.Before(p.ApprovedAt) {
+		return fmt.Errorf("%w: approved at %s, which is after now %s",
+			ErrPacketInvalid, p.ApprovedAt.UTC(), now.UTC())
+	}
 	if !now.Before(p.ExpiresAt) {
 		return fmt.Errorf("%w: expired at %s, now %s", ErrPacketExpired, p.ExpiresAt.UTC(), now.UTC())
 	}

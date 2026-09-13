@@ -31,14 +31,13 @@ func TestBC1ReadOnlyTaskCannotCompleteOnRepositoryEffectEvidence(t *testing.T) {
 	ctx := context.Background()
 	db := newDB(t)
 	f := seed(t, db, "bc1-generic", state.IntentReadOnly, state.LaneReview)
-
-	reviewed := sha("bc1-reviewed")
+	observed := sha("bc1-observed")
 
 	for _, kind := range []domain.EvidenceKind{domain.EvidenceBranchHead, domain.EvidencePullRequestHead} {
 		t.Run(string(kind), func(t *testing.T) {
 			// Equal published/observed SHAs, which for read-only work the
 			// worker effectively selects itself.
-			ev := evidenceFor(f, reviewed, reviewed, nil, kind)
+			ev := evidenceFor(f, observed, observed, nil, kind)
 			if err := db.Write(ctx, func(tx *store.Tx) error {
 				return tx.RecordEvidence(ctx, ev)
 			}); err != nil {
@@ -73,8 +72,7 @@ func TestBC1ReadOnlyTaskCompletesOnBoundReviewEvidence(t *testing.T) {
 	db := newDB(t)
 	f := seed(t, db, "bc1-review", state.IntentReadOnly, state.LaneReview)
 
-	reviewed := sha("bc1-good-reviewed")
-	ev := reviewEvidenceFor(f, reviewed, "bc1-artifact")
+	ev := reviewEvidenceFor(f, "bc1-artifact")
 
 	if err := db.Write(ctx, func(tx *store.Tx) error {
 		if err := tx.RecordEvidence(ctx, ev); err != nil {
@@ -102,8 +100,9 @@ func TestBC1ReadOnlyTaskCompletesOnBoundReviewEvidence(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if stored.ReviewedSHA != reviewed {
-			t.Fatalf("reviewed_sha roundtrip: got %q want %q", string(stored.ReviewedSHA), string(reviewed))
+		if stored.ReviewedSHA != f.Workspace.BaseSHA {
+			t.Fatalf("reviewed_sha roundtrip: got %q want %q",
+				string(stored.ReviewedSHA), string(f.Workspace.BaseSHA))
 		}
 		if stored.ArtifactDigest != ev.ArtifactDigest {
 			t.Fatalf("artifact_digest roundtrip: got %q want %q",
@@ -186,7 +185,7 @@ func TestBC1ReviewCannotReferenceAPublication(t *testing.T) {
 		t.Fatalf("record publish: %v", err)
 	}
 
-	ev := reviewEvidenceFor(mod, commit, "bc1-borrowed")
+	ev := reviewEvidenceFor(mod, "bc1-borrowed")
 	ev.PublishAttemptID = &pub.PublishAttemptID
 
 	if err := db.Write(ctx, func(tx *store.Tx) error {

@@ -397,6 +397,14 @@ func (t *Tx) RecordEvidence(ctx context.Context, e domain.EvidenceObservation) e
 	if err := t.requireLiveTask(ctx, e.TaskID); err != nil {
 		return err
 	}
+	// Review evidence names the commit the review ran against, so it must be
+	// the commit the workspace was checked out at. Without this, reviewed_sha
+	// is only compared with other caller-supplied values — the
+	// self-certification CC7 exists to forbid.
+	if e.IsReadOnlyReview() && e.ReviewedSHA != workspace.BaseSHA {
+		return fmt.Errorf("%w: reviewed_sha %s is not the workspace base_sha %s",
+			domain.ErrEvidenceMisattributed, string(e.ReviewedSHA), string(workspace.BaseSHA))
+	}
 	if err := e.CheckAttribution(domain.AttemptIdentity{
 		AttemptID:           attempt.AttemptID,
 		TaskID:              attempt.TaskID,

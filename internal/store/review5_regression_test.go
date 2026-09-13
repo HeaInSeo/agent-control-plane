@@ -240,6 +240,12 @@ func TestEveryMutatorRequiresOwnership(t *testing.T) {
 		"RecordEvidence": func(tx *store.Tx) error {
 			return tx.RecordEvidence(ctx, evidenceFor(f, commit, commit, nil, domain.EvidenceBranchHead))
 		},
+		// The status setter on the irreversible entity, and the only mutator
+		// that appends to history as a side effect. It was the one omission
+		// from this hand-written enumeration.
+		"SetPublishStatus": func(tx *store.Tx) error {
+			return tx.SetPublishStatus(ctx, ids.NewPublishAttemptID(), state.PublishApplied)
+		},
 		"AppendEvent": func(tx *store.Tx) error {
 			_, err := tx.AppendEvent(ctx, eventFor(f.Epoch, "unowned"))
 			return err

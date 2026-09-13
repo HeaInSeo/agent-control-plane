@@ -63,8 +63,7 @@ func TestTimestampWritesAreMonotonicAcrossEveryWriter(t *testing.T) {
 	t.Run("completion", func(t *testing.T) {
 		db := newDB(t)
 		f := seed(t, db, "r15-complete", state.IntentReadOnly, state.LaneReview)
-		reviewed := sha("r15-reviewed")
-		ev := reviewEvidenceFor(f, reviewed, "r15-artifact")
+		ev := reviewEvidenceFor(f, "r15-artifact")
 		if err := db.Write(ctx, func(tx *store.Tx) error {
 			return tx.RecordEvidence(ctx, ev)
 		}); err != nil {

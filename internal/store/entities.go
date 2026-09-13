@@ -234,6 +234,14 @@ func (t *Tx) ApprovePacket(ctx context.Context, p domain.ExecutionPacket) error 
 		return fmt.Errorf("%w: packet %s expires at %s, which has already passed",
 			domain.ErrPacketExpired, string(p.PacketID), p.ExpiresAt.UTC())
 	}
+	// And the window has a lower bound. A future-dated approval would grant
+	// live authority before its own stated start — a date typo or timezone
+	// bug — and packet content is immutable and undeletable, so it could only
+	// be marked stale, never corrected.
+	if p.ApprovedAt.After(t.Now()) {
+		return fmt.Errorf("%w: packet %s is dated %s, in the future",
+			domain.ErrPacketInvalid, string(p.PacketID), p.ApprovedAt.UTC())
+	}
 	allowed, err := domain.EncodeStringList(p.AllowedScope)
 	if err != nil {
 		return fmt.Errorf("encode allowed_scope: %w", err)

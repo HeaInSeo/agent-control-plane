@@ -214,10 +214,13 @@ func evidenceFor(f fixture, published, observed domain.CommitSHA, pub *ids.Publi
 	}
 }
 
-// reviewEvidenceFor builds valid READ_ONLY_REVIEW evidence for a fixture:
-// bound to the fixed reviewed commit, carrying an artifact digest, and
-// referencing no publication (CC7).
-func reviewEvidenceFor(f fixture, reviewed domain.CommitSHA, artifact string) domain.EvidenceObservation {
+// reviewEvidenceFor builds valid READ_ONLY_REVIEW evidence for a fixture.
+//
+// The reviewed commit is the fixture workspace's base_sha, not a free
+// parameter: review evidence names the commit the review actually ran
+// against, so it has to be the one the workspace was checked out at (CC7).
+func reviewEvidenceFor(f fixture, artifact string) domain.EvidenceObservation {
+	reviewed := f.Workspace.BaseSHA
 	return domain.EvidenceObservation{
 		EvidenceID:          ids.NewEvidenceID(),
 		TaskID:              f.Task.TaskID,

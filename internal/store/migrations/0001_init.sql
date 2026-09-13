@@ -102,12 +102,17 @@ BEGIN
 END;
 
 -- The stable identity of a subject never changes once observed.
-CREATE TRIGGER trg_repository_subject_node_id_immutable
+CREATE TRIGGER trg_repository_subject_identity_immutable
 BEFORE UPDATE ON repository_subject
 FOR EACH ROW
-WHEN NEW.github_node_id <> OLD.github_node_id
+WHEN NEW.github_node_id        IS NOT OLD.github_node_id
+  -- The control-plane identifier too: rewriting it on a row nothing
+  -- references yet mints a second identity for the same node id, which is
+  -- the identity fork CC5 and the no-delete trigger exist to prevent.
+  -- Referenced rows are only incidentally protected by their foreign keys.
+  OR NEW.repository_subject_id IS NOT OLD.repository_subject_id
 BEGIN
-    SELECT RAISE(ABORT, 'repository subject github_node_id is immutable');
+    SELECT RAISE(ABORT, 'repository subject identity is immutable');
 END;
 
 -- ---------------------------------------------------------------------------
@@ -576,6 +581,29 @@ CREATE TABLE workspace (
     CHECK (released_at IS NULL OR released_at >= created_at)
 ) WITHOUT ROWID;
 
+-- Containment, not just aliasing. UNIQUE(root_path) and the lexical
+-- canonicalisation in validateWorkspacePath only rule out two spellings of
+-- the same string; a path nested inside an existing workspace is a different
+-- string naming a tree inside another attempt's clone. The modifying attempt
+-- would then see the other's files in `git status`, could commit and publish
+-- them, and releasing either tree would destroy the other.
+--
+-- Unlike symlinks — deferred to the allocator, which can consult the real
+-- filesystem — containment is detectable purely lexically, so it belongs here.
+-- substr comparison rather than GLOB because a path may legitimately contain
+-- GLOB metacharacters.
+CREATE TRIGGER trg_workspace_no_nesting
+BEFORE INSERT ON workspace
+FOR EACH ROW
+WHEN EXISTS (
+        SELECT 1 FROM workspace
+         WHERE substr(NEW.root_path, 1, length(root_path) + 1) = root_path || '/'
+            OR substr(root_path, 1, length(NEW.root_path) + 1) = NEW.root_path || '/'
+     )
+BEGIN
+    SELECT RAISE(ABORT, 'workspace root_path cannot nest inside another workspace');
+END;
+
 CREATE TRIGGER trg_workspace_attempt_coherence
 BEFORE INSERT ON workspace
 FOR EACH ROW
@@ -896,6 +924,22 @@ END;
 
 -- If evidence names a publication, it must be that attempt's publication and
 -- must carry that publication's exact commit.
+-- Read-only review evidence names the commit the review ran against, so it
+-- must be the commit the workspace was checked out at. Comparing reviewed_sha
+-- only against observed_sha and published_sha compares caller-supplied values
+-- with each other, which is exactly the self-certification CC7 forbids. The
+-- modifying path has the analogous binding through
+-- publish_attempt.base_sha = workspace.base_sha.
+CREATE TRIGGER trg_evidence_review_binds_workspace
+BEFORE INSERT ON evidence_observation
+FOR EACH ROW
+WHEN NEW.evidence_kind = 'READ_ONLY_REVIEW'
+ AND (SELECT base_sha FROM workspace WHERE workspace_id = NEW.workspace_id)
+     IS NOT NEW.reviewed_sha
+BEGIN
+    SELECT RAISE(ABORT, 'reviewed_sha must be the workspace base_sha');
+END;
+
 CREATE TRIGGER trg_evidence_publish_coherence
 BEFORE INSERT ON evidence_observation
 FOR EACH ROW

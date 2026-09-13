@@ -258,9 +258,8 @@ func TestCompletedTaskCannotBeRebound(t *testing.T) {
 	db := newDB(t)
 	f := seed(t, db, "r2-recomplete", state.IntentReadOnly, state.LaneReview)
 
-	reviewed := sha("r2-recomplete-reviewed")
-	first := reviewEvidenceFor(f, reviewed, "artifact-one")
-	second := reviewEvidenceFor(f, reviewed, "artifact-two")
+	first := reviewEvidenceFor(f, "artifact-one")
+	second := reviewEvidenceFor(f, "artifact-two")
 
 	if err := db.Write(ctx, func(tx *store.Tx) error {
 		if err := tx.RecordEvidence(ctx, first); err != nil {

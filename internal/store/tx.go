@@ -149,8 +149,14 @@ func (db *DB) requireNoOpenTransaction() error {
 // the lock, and there is no way to ask that without the id: a plain flag
 // rejects legitimate concurrency, and a plain mutex hangs on nesting.
 //
-// A failure to parse degrades safely: id 0 never matches an owner, so the
-// call waits like any other concurrent caller.
+// If the id cannot be parsed the function returns 0, and nesting detection is
+// then unavailable for that call: runTx skips the check and takes the lock, so
+// a nested call on that goroutine would block on a mutex only it can release.
+// That is the deadlock this mechanism exists to prevent, so the fallback is
+// not "safe" — it is merely unreachable. runtime.Stack's first line is
+// "goroutine <id> [<state>]:", which fits the 64-byte buffer for any id Go
+// can produce. The honest statement is that there is no graceful degradation
+// here, only an unreachable branch.
 func goroutineID() uint64 {
 	var buf [64]byte
 	n := runtime.Stack(buf[:], false)
