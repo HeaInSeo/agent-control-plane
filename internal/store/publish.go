@@ -62,6 +62,9 @@ func (t *Tx) RecordPublishAttempt(ctx context.Context, p domain.PublishAttempt) 
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = t.Now()
 	}
+	if err := t.requireNotFuture("publish attempt", p.CreatedAt); err != nil {
+		return err
+	}
 	// Not merely defaulted: the status is pinned to PENDING two lines above,
 	// so the intent has by definition never moved. A caller populating both
 	// timestamps from separate clock reads would otherwise record "the status

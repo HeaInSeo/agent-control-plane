@@ -111,6 +111,11 @@ resolves the existing intent by its idempotency key and re-runs the gate, and
 an `APPLIED` or `OBSERVED` intent means the remote mutation already happened.
 Resolving an `UNKNOWN` outcome is reconciliation, not re-publication.
 
+Creating a workspace also revalidates packet authority, alongside admission
+and publication — it was the last execution-setup writer without that guard,
+and a workspace row is undeletable with a unique `root_path`, so minting one
+under lapsed authority permanently burns a directory for work that must stop.
+
 Creating a workspace, recording a publication and recording evidence all apply
 the same liveness fence as completion, on both the attempt and the task: a
 terminal attempt, a released workspace or a finished task cannot be given a
@@ -143,8 +148,11 @@ fenced-out attempt would sit in the pending queue for ever, resolvable only to
 
 Every timestamp that records "when this row last changed" is written
 monotonically, clamped to what the row already holds, and the ordering is a
-schema `CHECK` as well. Timestamps are defaulted before validation, not after,
-so the ordering check sees real values — validating first let a
+schema `CHECK` as well. A caller-supplied creation time may not be ahead of the store's clock: the
+monotonic clamp would raise every later update to it, so the field recording
+when a row last changed would report the wrong instant until real time caught
+up — on rows that are immutable or undeletable. Timestamps are defaulted
+before validation, not after, so the ordering check sees real values — validating first let a
 caller-supplied `created_at` pair with a store-supplied `updated_at` that
 preceded it, and the refusal arrived as a raw driver error rather than a typed
 one. A backward clock step — an NTP correction, a VM

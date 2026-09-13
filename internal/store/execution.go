@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/HeaInSeo/agent-control-plane/internal/domain"
 	"github.com/HeaInSeo/agent-control-plane/internal/ids"
@@ -41,6 +42,25 @@ func (t *Tx) requireLiveTask(ctx context.Context, id ids.TaskID) error {
 	}
 	if run.Status.IsTerminal() {
 		return fmt.Errorf("%w: task %s is %s", ErrTaskNotLive, string(id), string(run.Status))
+	}
+	return nil
+}
+
+// ErrFutureTimestamp is returned when a caller supplies a creation time that
+// is ahead of the store's clock.
+//
+// A future-dated creation time is uncorrectable by design: monotonicNow
+// clamps every later update up to it, so the field that records when a row
+// last changed reports the wrong instant until real time catches up — and
+// these rows are immutable or undeletable. ApprovePacket rejects future
+// dating for the same reason.
+var ErrFutureTimestamp = errors.New("timestamp is ahead of the store clock")
+
+// requireNotFuture rejects a creation time ahead of the store's clock.
+func (t *Tx) requireNotFuture(what string, created time.Time) error {
+	if now := t.Now(); created.After(now) {
+		return fmt.Errorf("%w: %s created_at %s is after now %s",
+			ErrFutureTimestamp, what, created.UTC(), now.UTC())
 	}
 	return nil
 }
@@ -152,6 +172,9 @@ func (t *Tx) CreateTaskRun(ctx context.Context, run domain.TaskRun) error {
 	}
 	if run.UpdatedAt.IsZero() {
 		run.UpdatedAt = run.CreatedAt
+	}
+	if err := t.requireNotFuture("task run", run.CreatedAt); err != nil {
+		return err
 	}
 	if err := run.Validate(); err != nil {
 		return err
@@ -486,6 +509,9 @@ func (t *Tx) CreateWorkerAttempt(ctx context.Context, a domain.WorkerAttempt) er
 	if a.UpdatedAt.IsZero() {
 		a.UpdatedAt = a.CreatedAt
 	}
+	if err := t.requireNotFuture("worker attempt", a.CreatedAt); err != nil {
+		return err
+	}
 	if err := a.Validate(); err != nil {
 		return err
 	}
@@ -653,6 +679,9 @@ func (t *Tx) CreateWorkspace(ctx context.Context, w domain.Workspace) error {
 	if w.CreatedAt.IsZero() {
 		w.CreatedAt = t.Now()
 	}
+	if err := t.requireNotFuture("workspace", w.CreatedAt); err != nil {
+		return err
+	}
 	if err := w.Validate(); err != nil {
 		return err
 	}
@@ -697,6 +726,15 @@ func (t *Tx) CreateWorkspace(ctx context.Context, w domain.Workspace) error {
 			ErrWorkspaceConflict, string(w.AttemptID), string(attempt.Status))
 	}
 	if err := t.requireLiveTask(ctx, w.TaskID); err != nil {
+		return err
+	}
+	// The workspace writer was the only execution-setup path without this.
+	// A STALE or expired packet means execution must stop, and a workspace
+	// row is undeletable with a UNIQUE root_path — so minting one under
+	// lapsed authority permanently burns a directory for work that can never
+	// be published from or completed, which is the same argument the
+	// terminal-attempt fence above rests on.
+	if err := t.requirePacketAuthority(ctx, attempt.PacketID); err != nil {
 		return err
 	}
 	if err := t.requireUnnestedWorkspacePath(ctx, w.RootPath); err != nil {

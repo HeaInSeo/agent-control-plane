@@ -25,8 +25,13 @@ func TestTimestampDefaultingHappensBeforeValidation(t *testing.T) {
 	f := seed(t, db, "r16-defaulting", state.IntentModifying, state.LaneOperator)
 
 	// A caller supplies created_at and leaves updated_at unset. The store's
-	// clock is behind it, which is what makes the pair out of order.
+	// clock being behind it is now refused outright (round 19, finding 3):
+	// a future-dated creation time is uncorrectable, because monotonicNow
+	// clamps every later update up to it. So the defaulting order is
+	// exercised with a clock at or ahead of the supplied time, and the
+	// behind-clock case asserts the rejection.
 	behind := db.WithClock(func() time.Time { return fixedNow.Add(-2 * time.Hour) })
+	ahead := db.WithClock(func() time.Time { return fixedNow.Add(2 * time.Hour) })
 
 	t.Run("task run", func(t *testing.T) {
 		taskID := ids.NewTaskID()
@@ -37,18 +42,25 @@ func TestTimestampDefaultingHappensBeforeValidation(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("approve: %v", err)
 		}
-		err := behind.Write(ctx, func(tx *store.Tx) error {
-			return tx.CreateTaskRun(ctx, domain.TaskRun{
-				TaskID:              taskID,
-				RepositorySubjectID: f.Subject.RepositorySubjectID,
-				PacketID:            packet.PacketID,
-				Lane:                state.LaneOperator,
-				Intent:              state.IntentModifying,
-				Status:              state.TaskReady,
-				CreatedAt:           fixedNow,
-			})
-		})
-		if err != nil {
+		run := domain.TaskRun{
+			TaskID:              taskID,
+			RepositorySubjectID: f.Subject.RepositorySubjectID,
+			PacketID:            packet.PacketID,
+			Lane:                state.LaneOperator,
+			Intent:              state.IntentModifying,
+			Status:              state.TaskReady,
+			CreatedAt:           fixedNow,
+		}
+		// Behind the supplied created_at: refused, not silently reconciled.
+		if err := behind.Write(ctx, func(tx *store.Tx) error {
+			return tx.CreateTaskRun(ctx, run)
+		}); !errors.Is(err, store.ErrFutureTimestamp) {
+			t.Fatalf("want ErrFutureTimestamp, got %v", err)
+		}
+		// At or ahead of it: the store fills updated_at coherently.
+		if err := ahead.Write(ctx, func(tx *store.Tx) error {
+			return tx.CreateTaskRun(ctx, run)
+		}); err != nil {
 			t.Fatalf("the store should fill updated_at coherently: %v", err)
 		}
 		if err := db.Read(ctx, func(tx *store.Tx) error {
@@ -78,6 +90,11 @@ func TestTimestampDefaultingHappensBeforeValidation(t *testing.T) {
 			t.Fatalf("retire: %v", err)
 		}
 		if err := behind.Write(ctx, func(tx *store.Tx) error {
+			return tx.CreateWorkerAttempt(ctx, successor)
+		}); !errors.Is(err, store.ErrFutureTimestamp) {
+			t.Fatalf("want ErrFutureTimestamp, got %v", err)
+		}
+		if err := ahead.Write(ctx, func(tx *store.Tx) error {
 			return tx.CreateWorkerAttempt(ctx, successor)
 		}); err != nil {
 			t.Fatalf("the store should fill updated_at coherently: %v", err)

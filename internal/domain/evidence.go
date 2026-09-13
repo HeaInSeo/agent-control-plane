@@ -294,6 +294,16 @@ func DeriveTaskCompletion(in CompletionInput) (state.TaskRunStatus, error) {
 			return "", fmt.Errorf("%w: read-only completion requires reviewed_sha and artifact_digest",
 				ErrEvidenceInsufficient)
 		}
+
+	default:
+		// Fail closed on an intent this function has no evidence contract
+		// for. Intent.Validate above keeps the switch total today, so this is
+		// unreachable — but this is the only function that can produce
+		// TaskCompleted, and a third intent added to the bounded set would
+		// otherwise skip the switch body entirely and complete the task with
+		// no contract applied at all.
+		return "", fmt.Errorf("%w: no completion contract for intent %q",
+			ErrEvidenceInsufficient, string(in.Intent))
 	}
 	return state.TaskCompleted, nil
 }

@@ -62,6 +62,10 @@ func (t *Tx) AppendEvent(ctx context.Context, e domain.Event) (int64, error) {
 			return 0, fmt.Errorf("%w: event_id %s is already recorded: %w",
 				ErrDuplicateEventIdentity, string(e.EventID), err)
 		}
+		if isUniqueViolationOn(err, "event.scheduler_epoch", "event.seq") {
+			return 0, fmt.Errorf("%w: (epoch %d, seq %d) is already recorded: %w",
+				ErrDuplicateEventIdentity, int64(e.SchedulerEpoch), seq, err)
+		}
 		return 0, fmt.Errorf("append event: %w", err)
 	}
 	return seq, nil
@@ -179,7 +183,11 @@ func (t *Tx) EventsInEpochPage(ctx context.Context, epoch domain.Epoch, afterSeq
 	return out, nil
 }
 
-// ErrDuplicateEventIdentity is returned when (scheduler_epoch, seq) collides.
+// ErrDuplicateEventIdentity is returned when an event's identity is already
+// recorded — either its event_id or its (scheduler_epoch, seq) position.
+//
+// Both are mapped, because a caller matching on this sentinel to decide
+// whether an append already landed cannot know which constraint fired.
 var ErrDuplicateEventIdentity = errors.New("duplicate event identity")
 
 // isUniqueViolation reports whether err is a SQLite uniqueness failure.

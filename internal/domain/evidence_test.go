@@ -328,3 +328,36 @@ func TestRepositoryEffectEvidenceRejectsReviewBinding(t *testing.T) {
 		}
 	})
 }
+
+// Finding 19.2: the intent switch had no default, so a third intent added to
+// the bounded set would skip the switch body entirely and complete the task
+// with no evidence contract applied — in the one function documented as the
+// only way to obtain TaskCompleted.
+func TestCompletionFailsClosedOnAnUnknownIntent(t *testing.T) {
+	id := attemptIdentity()
+	in := domain.CompletionInput{
+		Attempt:       id,
+		Evidence:      evidenceMatching(id, ourCommit, ourCommit),
+		PublishStatus: state.PublishObserved,
+		Intent:        state.Intent("ADVISORY"),
+	}
+	status, err := domain.DeriveTaskCompletion(in)
+	if err == nil {
+		t.Fatalf("an unknown intent derived status %q", string(status))
+	}
+	if status != "" {
+		t.Fatalf("a refused completion returned status %q", string(status))
+	}
+
+	// The two defined intents still work.
+	in.Intent = state.IntentModifying
+	if _, err := domain.DeriveTaskCompletion(in); err != nil {
+		t.Fatalf("modifying completion refused: %v", err)
+	}
+	in.Intent = state.IntentReadOnly
+	in.Evidence = reviewEvidenceMatching(id, ourCommit)
+	in.PublishStatus = state.PublishUnknown
+	if _, err := domain.DeriveTaskCompletion(in); err != nil {
+		t.Fatalf("read-only completion refused: %v", err)
+	}
+}

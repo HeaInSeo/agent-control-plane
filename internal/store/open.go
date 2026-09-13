@@ -124,13 +124,25 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
-// validate rejects a configuration whose values cannot be expressed faithfully.
+// validate rejects a configuration whose values cannot be expressed
+// faithfully.
+//
+// It runs on the caller's configuration, before defaults are applied.
+// Defaulting first would hide exactly the values worth rejecting: a negative
+// BusyTimeout — which a caller computing time.Until(deadline) against an
+// already-passed deadline produces — looks identical to "unset" once
+// withDefaults has replaced it, so the caller would silently get a ten-second
+// lock wait instead of the error this function promises.
 func (c Config) validate() error {
 	if c.Path == "" {
 		return errors.New("store: Config.Path is required")
 	}
 	if err := c.Mode.Validate(); err != nil {
 		return err
+	}
+	if c.BusyTimeout < 0 {
+		return fmt.Errorf("store: BusyTimeout %s is negative; leave it unset for the default",
+			c.BusyTimeout)
 	}
 	// SQLite's busy_timeout is in milliseconds, so a sub-millisecond value
 	// truncates to zero — which means "do not wait at all", the opposite of
@@ -177,10 +189,10 @@ type DB struct {
 // ActivateScheduler, which requires a read-write handle and a successful
 // activation transaction (CC4).
 func Open(ctx context.Context, cfg Config) (*DB, error) {
-	cfg = cfg.withDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+	cfg = cfg.withDefaults()
 	// The DSN is a file: URI, and a relative path in one is read as a URI
 	// authority rather than a path — SQLite would reject "file://sub/cp.db"
 	// with an opaque "invalid uri authority" error after stat and MkdirAll
