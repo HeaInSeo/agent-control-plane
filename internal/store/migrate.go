@@ -108,13 +108,19 @@ func parseMigrationName(filename string) (int, string, error) {
 	return version, name, nil
 }
 
-// Migrate brings the database up to the given migration set.
+// migrate brings the database up to the given migration set.
 //
 // It is idempotent: running it against an already-current database applies
 // nothing and instead re-verifies the recorded history, so a replay is also a
 // consistency check. Anything unexpected stops the process rather than
 // attempting a repair.
-func (db *DB) Migrate(ctx context.Context, set []Migration) error {
+//
+// Unexported: applying a set other than the embedded one records versions and
+// checksums that Open will reject for ever, while the contract marker is
+// stamped as current so the file still looks openable — and Open is the only
+// way to obtain a handle, so recovery would mean hand-editing the database.
+// Tests that need a custom set reach it through the test-only wrapper.
+func (db *DB) migrate(ctx context.Context, set []Migration) error {
 	if err := db.requireNoOpenTransaction(); err != nil {
 		return err
 	}
@@ -152,7 +158,7 @@ func (db *DB) MigrateEmbedded(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return db.Migrate(ctx, set)
+	return db.migrate(ctx, set)
 }
 
 // dbKind is the value stored under the `db_kind` marker key. Open refuses a

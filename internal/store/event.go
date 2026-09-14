@@ -58,15 +58,7 @@ func (t *Tx) AppendEvent(ctx context.Context, e domain.Event) (int64, error) {
 		e.EventType, string(e.SubjectKind), e.SubjectID,
 		taskIDArg(e.TaskID), attemptIDArg(e.AttemptID), fields,
 	); err != nil {
-		if isUniqueViolationOn(err, "event.event_id") {
-			return 0, fmt.Errorf("%w: event_id %s is already recorded: %w",
-				ErrDuplicateEventIdentity, string(e.EventID), err)
-		}
-		if isUniqueViolationOn(err, "event.scheduler_epoch", "event.seq") {
-			return 0, fmt.Errorf("%w: (epoch %d, seq %d) is already recorded: %w",
-				ErrDuplicateEventIdentity, int64(e.SchedulerEpoch), seq, err)
-		}
-		return 0, fmt.Errorf("append event: %w", err)
+		return 0, mapEventInsertError(err, e, seq)
 	}
 	return seq, nil
 }
@@ -181,6 +173,24 @@ func (t *Tx) EventsInEpochPage(ctx context.Context, epoch domain.Epoch, afterSeq
 		return nil, fmt.Errorf("iterate events: %w", err)
 	}
 	return out, nil
+}
+
+// mapEventInsertError turns an event insert failure into a typed error.
+//
+// Shared with the test-only explicit-sequence append, so the mapping the
+// production path relies on is the one the tests exercise. Writing it twice
+// let the (epoch, seq) branch go unverified — including whether the driver's
+// message names both columns.
+func mapEventInsertError(err error, e domain.Event, seq int64) error {
+	if isUniqueViolationOn(err, "event.event_id") {
+		return fmt.Errorf("%w: event_id %s is already recorded: %w",
+			ErrDuplicateEventIdentity, string(e.EventID), err)
+	}
+	if isUniqueViolationOn(err, "event.scheduler_epoch", "event.seq") {
+		return fmt.Errorf("%w: (epoch %d, seq %d) is already recorded: %w",
+			ErrDuplicateEventIdentity, int64(e.SchedulerEpoch), seq, err)
+	}
+	return fmt.Errorf("append event: %w", err)
 }
 
 // ErrDuplicateEventIdentity is returned when an event's identity is already

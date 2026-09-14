@@ -25,11 +25,14 @@ func TestTiedObservationDoesNotRevertTheAlias(t *testing.T) {
 	f := seed(t, db, "r11-tie", state.IntentReadOnly, state.LaneReview)
 
 	sameInstant := f.Subject.ObservedAt.Add(time.Hour)
+	// The clock reads the instant being observed: a future-dated observation
+	// is refused, so the tie has to be produced at real time.
+	atInstant := db.WithClock(func() time.Time { return sameInstant })
 
 	renamed := f.Subject
 	renamed.CurrentFullName = "HeaInSeo/r11-renamed"
 	renamed.ObservedAt = sameInstant
-	if err := db.Write(ctx, func(tx *store.Tx) error {
+	if err := atInstant.Write(ctx, func(tx *store.Tx) error {
 		_, err := tx.ObserveRepositorySubject(ctx, renamed)
 		return err
 	}); err != nil {
@@ -39,7 +42,7 @@ func TestTiedObservationDoesNotRevertTheAlias(t *testing.T) {
 	// A replay of the pre-rename snapshot, from the very same second.
 	replay := f.Subject
 	replay.ObservedAt = sameInstant
-	if err := db.Write(ctx, func(tx *store.Tx) error {
+	if err := atInstant.Write(ctx, func(tx *store.Tx) error {
 		got, err := tx.ObserveRepositorySubject(ctx, replay)
 		if err != nil {
 			return err

@@ -148,7 +148,13 @@ fenced-out attempt would sit in the pending queue for ever, resolvable only to
 
 Every timestamp that records "when this row last changed" is written
 monotonically, clamped to what the row already holds, and the ordering is a
-schema `CHECK` as well. A caller-supplied creation time may not be ahead of the store's clock: the
+schema `CHECK` as well. No caller-supplied timestamp may be ahead of the store's clock — creation
+times, observation times and the repository alias's `observed_at` alike. The
+alias case is the sharpest: `observed_at` is the only ordering guard on a
+rename, so one skewed observation would silently drop every correctly
+timestamped rename that followed, with no update, no event and no error.
+
+A caller-supplied creation time may not be ahead of the store's clock: the
 monotonic clamp would raise every later update to it, so the field recording
 when a row last changed would report the wrong instant until real time caught
 up — on rows that are immutable or undeletable. Timestamps are defaulted
@@ -581,6 +587,11 @@ relation in the schema. `VerifyConnectionPragmas` asserts they are actually in
 force rather than assuming it. `journal_mode` is a property of the database
 file rather than of the connection, so it is set once.
 
+A file carrying a valid SQLite header but holding no tables counts as absent
+too. That is exactly what Open itself leaves behind — enabling WAL writes the
+header before any migration runs — so treating it as an existing database let
+a later open without `AllowCreate` produce a fresh, empty control plane.
+
 Open fails closed on: a missing file without explicit `AllowCreate`; a
 read-only handle asked to create; a file that is not SQLite; a SQLite file
 without this control plane's `db_kind` marker; a failed integrity check. A
@@ -590,6 +601,12 @@ A zero-length file counts as absent for those gates. It is what SQLite leaves
 before its first write, but also what a typo or an abandoned run leaves, and
 treating it as an existing database would let a mistyped path silently yield a
 fresh, empty control plane — the exact case `AllowCreate` exists to prevent.
+
+`MigrateEmbedded` is the only production entry point. Applying an arbitrary
+set would record versions and checksums that Open rejects for ever, while the
+contract marker is stamped as current so the file still looks openable — and
+Open is the only way to obtain a handle, so recovery would mean hand-editing
+the database. A custom set is reachable only from the test build.
 
 Migrations are embedded, forward-only and contiguous from version 1, each
 recorded with a SHA-256 checksum. Replay is idempotent and doubles as a

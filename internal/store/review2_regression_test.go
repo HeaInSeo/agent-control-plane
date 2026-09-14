@@ -499,10 +499,12 @@ func TestUnchangedObservationRefreshesObservedAt(t *testing.T) {
 	t2 := t1.Add(time.Hour)
 	t3 := t1.Add(2 * time.Hour)
 
-	// Confirm the same alias at t3.
+	// Confirm the same alias at t3, with the clock reading t3: a
+	// future-dated observation is refused.
 	confirm := f.Subject
 	confirm.ObservedAt = t3
-	if err := db.Write(ctx, func(tx *store.Tx) error {
+	atT3 := db.WithClock(func() time.Time { return t3 })
+	if err := atT3.Write(ctx, func(tx *store.Tx) error {
 		got, err := tx.ObserveRepositorySubject(ctx, confirm)
 		if err != nil {
 			return err
@@ -519,7 +521,7 @@ func TestUnchangedObservationRefreshesObservedAt(t *testing.T) {
 	stale := f.Subject
 	stale.CurrentFullName = "HeaInSeo/stale-name"
 	stale.ObservedAt = t2
-	if err := db.Write(ctx, func(tx *store.Tx) error {
+	if err := atT3.Write(ctx, func(tx *store.Tx) error {
 		got, err := tx.ObserveRepositorySubject(ctx, stale)
 		if err != nil {
 			return err

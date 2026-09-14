@@ -350,11 +350,13 @@ func EncodeFields(in map[string]any) (string, error) {
 		return "{}", nil
 	}
 
-	normalised, err := normaliseFields(in)
-	if err != nil {
-		return "", err
-	}
-	redacted := redactNormalised(normalised)
+	// RedactFields degrades per key, replacing a value it cannot encode with
+	// the Unencodable marker. Returning an error here instead would cost the
+	// caller its whole transaction: AppendEvent propagates it, and
+	// SetPublishStatus appends after its UPDATE, so one NaN in a telemetry
+	// field would roll back the state transition itself. Losing the field is
+	// the right trade; losing the transition is not.
+	redacted := RedactFields(in)
 	if len(redacted) == 0 {
 		return "{}", nil
 	}

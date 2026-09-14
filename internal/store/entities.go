@@ -32,6 +32,14 @@ func (t *Tx) ObserveRepositorySubject(ctx context.Context, subject domain.Reposi
 	if err := t.RequireOwnership(ctx); err != nil {
 		return domain.RepositorySubject{}, err
 	}
+	// observed_at is the only ordering guard on a rename, so an unbounded
+	// future value is worse here than elsewhere: one skewed observation would
+	// silently drop every correctly-timestamped rename that followed — no
+	// update, no event, no error — until real time caught up, while
+	// RepositorySubjectByFullName kept resolving the stale alias.
+	if err := t.requireNotFuture("repository subject", "observed_at", subject.ObservedAt); err != nil {
+		return domain.RepositorySubject{}, err
+	}
 
 	existing, err := t.RepositorySubjectByNodeID(ctx, subject.GitHubNodeID)
 	switch {

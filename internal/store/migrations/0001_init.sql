@@ -453,6 +453,12 @@ CREATE TABLE worker_attempt (
     updated_at            TEXT NOT NULL,
 
     CHECK (updated_at >= created_at),
+    -- The same guard the other optional timestamps carry: a lease or
+    -- checkpoint cannot predate the attempt it belongs to. Nothing writes
+    -- these columns after insert and worker_attempt rejects DELETE, so an
+    -- already-expired lease would be uncorrectable.
+    CHECK (lease_expires_at IS NULL OR lease_expires_at >= created_at),
+    CHECK (last_checkpoint_at IS NULL OR last_checkpoint_at >= created_at),
 
     UNIQUE (task_id, fence_epoch)
 ) WITHOUT ROWID;

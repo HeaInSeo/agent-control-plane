@@ -159,7 +159,7 @@ CREATE TABLE usage_observation (
 ALTER TABLE task_run ADD COLUMN projection_synced_at TEXT;`,
 	})
 
-	if err := db.Migrate(ctx, future); err != nil {
+	if err := db.MigrateForTest(ctx, future); err != nil {
 		t.Fatalf("additive migration on populated database: %v", err)
 	}
 

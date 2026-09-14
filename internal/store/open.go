@@ -251,7 +251,29 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		_ = sqlDB.Close()
 		return nil, err
 	}
-	if state.holdsDatabase() {
+	// A file can carry a valid SQLite header and still hold no database —
+	// which is exactly what Open itself leaves behind, since enabling WAL
+	// writes the header before any migration runs. Treating that as an
+	// existing database let a later open without AllowCreate produce a fresh,
+	// empty control plane: the outcome AllowCreate exists to prevent.
+	populated, err := db.hasTables(ctx)
+	if err != nil {
+		_ = sqlDB.Close()
+		return nil, err
+	}
+	if !populated {
+		if cfg.Mode == ModeReadOnly {
+			_ = sqlDB.Close()
+			return nil, fmt.Errorf("%w: %s holds no database (read-only open cannot create)",
+				ErrDatabaseNotFound, cfg.Path)
+		}
+		if !cfg.AllowCreate {
+			_ = sqlDB.Close()
+			return nil, fmt.Errorf("%w: %s holds no database (set AllowCreate to bootstrap one)",
+				ErrDatabaseNotFound, cfg.Path)
+		}
+	}
+	if populated {
 		if err := db.verifyOwnMarker(ctx); err != nil {
 			_ = sqlDB.Close()
 			return nil, err
@@ -484,22 +506,12 @@ func (db *DB) runIntegrityCheck(ctx context.Context, pragma string) error {
 // database is therefore recognised as ours and can be retried; there is no
 // intermediate state with tables but no marker to make an allowance for.
 func (db *DB) verifyOwnMarker(ctx context.Context) error {
-	var tables int
-	if err := db.sql.QueryRowContext(ctx,
-		`SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`,
-	).Scan(&tables); err != nil {
-		return fmt.Errorf("store: read schema catalogue: %w", err)
-	}
-	if tables == 0 {
-		return nil
-	}
-
 	var kind string
 	err := db.sql.QueryRowContext(ctx,
 		`SELECT value FROM control_plane_meta WHERE key = 'db_kind'`).Scan(&kind)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return fmt.Errorf("%w: %s has %d tables but no db_kind marker", ErrForeignDatabase, db.path, tables)
+		return fmt.Errorf("%w: %s has tables but no db_kind marker", ErrForeignDatabase, db.path)
 	case err != nil:
 		return fmt.Errorf("%w: %s: %w", ErrForeignDatabase, db.path, err)
 	case kind != dbKind:
@@ -599,6 +611,17 @@ func (db *DB) shallowCopy() *DB {
 		txOwner:         db.txOwner,
 		assumeOwnership: db.assumeOwnership,
 	}
+}
+
+// hasTables reports whether the database holds any non-internal table.
+func (db *DB) hasTables(ctx context.Context) (bool, error) {
+	var tables int
+	if err := db.sql.QueryRowContext(ctx,
+		`SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`,
+	).Scan(&tables); err != nil {
+		return false, fmt.Errorf("store: read schema catalogue: %w", err)
+	}
+	return tables > 0, nil
 }
 
 // Mode reports the handle's access mode.

@@ -286,9 +286,13 @@ That is deliberate: none of those words is part of the event vocabulary this
 control plane writes, and for a name that reads as a bare credential word the
 safe reading is that it holds one.
 
-A value JSON cannot encode — a NaN or infinite float, a channel, a function —
-is replaced with an explicit `[UNENCODABLE]` marker rather than passed
-through, and its siblings are still redacted. Failing over to an
+A value JSON cannot encode — a NaN or infinite float, a channel, a function,
+a cyclic structure — is replaced with an explicit `[UNENCODABLE]` marker
+rather than passed through, and its siblings are still redacted. It degrades
+rather than erroring, deliberately: `AppendEvent` propagates an encode error
+and `SetPublishStatus` appends after its `UPDATE`, so failing would cost the
+caller the state transition itself. Losing the field is the right trade;
+losing the transition is not. Failing over to an
 uninspected walk would have let one unrelated telemetry value defeat
 redaction for every other field in the same event.
 

@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	"github.com/HeaInSeo/agent-control-plane/internal/domain"
@@ -81,11 +80,7 @@ func (t *Tx) AppendEventAt(ctx context.Context, e domain.Event, seq int64) error
 		e.EventType, string(e.SubjectKind), e.SubjectID,
 		taskIDArg(e.TaskID), attemptIDArg(e.AttemptID), fields,
 	); err != nil {
-		if isUniqueViolation(err) {
-			return fmt.Errorf("%w: event (epoch %d, seq %d) already exists: %w",
-				ErrDuplicateEventIdentity, int64(e.SchedulerEpoch), seq, err)
-		}
-		return fmt.Errorf("append event at seq %d: %w", seq, err)
+		return mapEventInsertError(err, e, seq)
 	}
 	return nil
 }
@@ -116,4 +111,13 @@ func (t *Tx) QueryPlanForTest(ctx context.Context, query string, args ...any) (s
 		return "", err
 	}
 	return strings.Join(details, " | "), nil
+}
+
+// MigrateForTest applies an arbitrary migration set.
+//
+// Test-only: a set other than the embedded one leaves a ledger Open will
+// reject for ever, with no in-tree way back, so production code has only
+// MigrateEmbedded.
+func (db *DB) MigrateForTest(ctx context.Context, set []Migration) error {
+	return db.migrate(ctx, set)
 }

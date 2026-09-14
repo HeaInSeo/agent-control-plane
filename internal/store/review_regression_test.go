@@ -658,21 +658,43 @@ func TestRedactionHandlesHostileFieldShapes(t *testing.T) {
 	db := newDB(t)
 	f := seed(t, db, "rr-hostile", state.IntentReadOnly, state.LaneReview)
 
-	t.Run("self-referential value is an error, not a crash", func(t *testing.T) {
+	t.Run("self-referential value degrades, and does not crash", func(t *testing.T) {
 		cyclic := map[string]any{"name": "loop"}
 		cyclic["self"] = cyclic
 
 		e := eventFor(f.Epoch, "hostile.cycle")
 		e.Fields = cyclic
-		err := db.Write(ctx, func(tx *store.Tx) error {
+		if err := db.Write(ctx, func(tx *store.Tx) error {
 			_, err := tx.AppendEvent(ctx, e)
 			return err
-		})
-		if err == nil {
-			t.Fatal("a cyclic field structure was accepted")
+		}); err != nil {
+			t.Fatalf("a cyclic field should degrade, not fail the append: %v", err)
 		}
-		if !strings.Contains(strings.ToLower(err.Error()), "cycle") {
-			t.Fatalf("expected a clean cycle error, got: %v", err)
+
+		// The append landed, the unencodable field is marked, and the
+		// sibling survived — losing the field is the right trade, losing the
+		// caller's transaction is not.
+		if err := db.Read(ctx, func(tx *store.Tx) error {
+			events, err := tx.EventsInEpoch(ctx, f.Epoch)
+			if err != nil {
+				return err
+			}
+			for _, stored := range events {
+				if stored.EventType != "hostile.cycle" {
+					continue
+				}
+				if stored.Fields["self"] != domain.Unencodable {
+					t.Fatalf("the cyclic field was stored as %v", stored.Fields["self"])
+				}
+				if stored.Fields["name"] != "loop" {
+					t.Fatalf("a sibling field was lost: %v", stored.Fields["name"])
+				}
+				return nil
+			}
+			t.Fatal("the append did not land")
+			return nil
+		}); err != nil {
+			t.Fatalf("read: %v", err)
 		}
 	})
 
@@ -737,7 +759,8 @@ func TestStaleRepositoryObservationIsIgnored(t *testing.T) {
 	renamed := f.Subject
 	renamed.CurrentFullName = "HeaInSeo/rr-renamed"
 	renamed.ObservedAt = fixedNow.Add(time.Hour)
-	if err := db.Write(ctx, func(tx *store.Tx) error {
+	later := db.WithClock(func() time.Time { return renamed.ObservedAt })
+	if err := later.Write(ctx, func(tx *store.Tx) error {
 		_, err := tx.ObserveRepositorySubject(ctx, renamed)
 		return err
 	}); err != nil {

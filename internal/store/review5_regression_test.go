@@ -310,7 +310,8 @@ func TestRenameAlwaysRecordsItsPreviousAlias(t *testing.T) {
 	renamed := f.Subject
 	renamed.CurrentFullName = "HeaInSeo/r5-renamed"
 	renamed.ObservedAt = fixedNow.Add(time.Hour)
-	if err := db.Write(ctx, func(tx *store.Tx) error {
+	later := db.WithClock(func() time.Time { return renamed.ObservedAt })
+	if err := later.Write(ctx, func(tx *store.Tx) error {
 		_, err := tx.ObserveRepositorySubject(ctx, renamed)
 		return err
 	}); err != nil {

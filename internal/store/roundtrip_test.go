@@ -262,7 +262,10 @@ func TestRepositorySubjectRenameKeepsOneIdentity(t *testing.T) {
 	renamed.RepositorySubjectID = ids.NewRepositorySubjectID() // a caller minting a new id
 	renamed.ObservedAt = fixedNow.Add(time.Hour)
 
-	if err := db.Write(ctx, func(tx *store.Tx) error {
+	// A rename observed an hour later happens when the clock reads an hour
+	// later; a future-dated observation is refused.
+	later := db.WithClock(func() time.Time { return renamed.ObservedAt })
+	if err := later.Write(ctx, func(tx *store.Tx) error {
 		got, err := tx.ObserveRepositorySubject(ctx, renamed)
 		if err != nil {
 			return err

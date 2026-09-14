@@ -63,6 +63,13 @@ type Tx struct {
 // release its workspace, or mark its packet STALE — all writes that target
 // current-epoch rows and so pass every row-level check.
 func (t *Tx) RequireOwnership(ctx context.Context) error {
+	// A read-only transaction cannot own a mutation, and every mutator calls
+	// this first — so refusing here means a read-only caller is refused
+	// before its inputs are validated, rather than being told about a
+	// timestamp it was never going to be allowed to write.
+	if t.readOnly {
+		return fmt.Errorf("%w: this transaction is read-only", ErrReadOnly)
+	}
 	if t.ownershipAssumed {
 		return nil
 	}

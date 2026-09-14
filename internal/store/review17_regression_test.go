@@ -205,7 +205,8 @@ func TestRepositorySubjectIdentifierIsImmutable(t *testing.T) {
 	renamed := subject
 	renamed.CurrentFullName = "HeaInSeo/r17-renamed"
 	renamed.ObservedAt = fixedNow.Add(time.Hour)
-	if err := db.Write(ctx, func(tx *store.Tx) error {
+	later := db.WithClock(func() time.Time { return renamed.ObservedAt })
+	if err := later.Write(ctx, func(tx *store.Tx) error {
 		got, err := tx.ObserveRepositorySubject(ctx, renamed)
 		if err != nil {
 			return err

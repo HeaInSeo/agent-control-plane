@@ -62,7 +62,7 @@ func (t *Tx) RecordPublishAttempt(ctx context.Context, p domain.PublishAttempt) 
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = t.Now()
 	}
-	if err := t.requireNotFuture("publish attempt", p.CreatedAt); err != nil {
+	if err := t.requireNotFuture("publish attempt", "created_at", p.CreatedAt); err != nil {
 		return err
 	}
 	// Not merely defaulted: the status is pinned to PENDING two lines above,
@@ -105,6 +105,35 @@ func (t *Tx) RecordPublishAttempt(ctx context.Context, p domain.PublishAttempt) 
 			domain.ErrPublishBindingInvalid, string(p.WorkspaceID),
 			string(workspace.AttemptID), string(p.AttemptID))
 	}
+	// The remaining fields trg_publish_attempt_binding_coherence covers. The
+	// convention in this file is that a mis-wired publication is a typed
+	// refusal rather than a raw constraint failure a caller cannot tell apart
+	// from a corrupt database; two fields had it and four did not.
+	if p.TaskID != attempt.TaskID {
+		return fmt.Errorf("%w: attempt %s belongs to task %s, not %s",
+			domain.ErrPublishBindingInvalid, string(p.AttemptID),
+			string(attempt.TaskID), string(p.TaskID))
+	}
+	if p.SchedulerEpoch != attempt.SchedulerEpoch {
+		return fmt.Errorf("%w: attempt %s is bound to scheduler epoch %d, not %d",
+			domain.ErrPublishBindingInvalid, string(p.AttemptID),
+			int64(attempt.SchedulerEpoch), int64(p.SchedulerEpoch))
+	}
+	if p.FenceEpoch != attempt.FenceEpoch {
+		return fmt.Errorf("%w: attempt %s is at fence epoch %d, not %d",
+			domain.ErrPublishBindingInvalid, string(p.AttemptID),
+			int64(attempt.FenceEpoch), int64(p.FenceEpoch))
+	}
+	if p.RepositorySubjectID != attempt.RepositorySubjectID {
+		return fmt.Errorf("%w: attempt %s operates on repository subject %s, not %s",
+			domain.ErrPublishBindingInvalid, string(p.AttemptID),
+			string(attempt.RepositorySubjectID), string(p.RepositorySubjectID))
+	}
+	if p.BaseSHA != workspace.BaseSHA {
+		return fmt.Errorf("%w: workspace %s is based on %s, not %s",
+			domain.ErrPublishBindingInvalid, string(p.WorkspaceID),
+			string(workspace.BaseSHA), string(p.BaseSHA))
+	}
 	if attempt.Intent != state.IntentModifying {
 		return fmt.Errorf("%w: attempt %s is %s and publishes nothing",
 			domain.ErrPublishBindingInvalid, string(p.AttemptID), string(attempt.Intent))
@@ -121,7 +150,7 @@ func (t *Tx) RecordPublishAttempt(ctx context.Context, p domain.PublishAttempt) 
 	// And the task itself must still be live. Publication is the irreversible
 	// step: a cancelled task whose push still went out is the worst outcome
 	// this control plane can produce.
-	if err := t.requireLiveTask(ctx, p.TaskID); err != nil {
+	if err := t.requireLiveTask(ctx, attempt.TaskID); err != nil {
 		return err
 	}
 
@@ -366,6 +395,9 @@ func (t *Tx) RecordEvidence(ctx context.Context, e domain.EvidenceObservation) e
 		return err
 	}
 	if err := e.Validate(); err != nil {
+		return err
+	}
+	if err := t.requireNotFuture("evidence observation", "observed_at", e.ObservedAt); err != nil {
 		return err
 	}
 	attempt, err := t.WorkerAttempt(ctx, e.AttemptID)

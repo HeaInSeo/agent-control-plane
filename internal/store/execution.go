@@ -56,11 +56,12 @@ func (t *Tx) requireLiveTask(ctx context.Context, id ids.TaskID) error {
 // dating for the same reason.
 var ErrFutureTimestamp = errors.New("timestamp is ahead of the store clock")
 
-// requireNotFuture rejects a creation time ahead of the store's clock.
-func (t *Tx) requireNotFuture(what string, created time.Time) error {
-	if now := t.Now(); created.After(now) {
-		return fmt.Errorf("%w: %s created_at %s is after now %s",
-			ErrFutureTimestamp, what, created.UTC(), now.UTC())
+// requireNotFuture rejects a caller-supplied timestamp ahead of the store's
+// clock. field names the column, so the error says which one.
+func (t *Tx) requireNotFuture(what, field string, supplied time.Time) error {
+	if now := t.Now(); supplied.After(now) {
+		return fmt.Errorf("%w: %s %s %s is after now %s",
+			ErrFutureTimestamp, what, field, supplied.UTC(), now.UTC())
 	}
 	return nil
 }
@@ -173,7 +174,7 @@ func (t *Tx) CreateTaskRun(ctx context.Context, run domain.TaskRun) error {
 	if run.UpdatedAt.IsZero() {
 		run.UpdatedAt = run.CreatedAt
 	}
-	if err := t.requireNotFuture("task run", run.CreatedAt); err != nil {
+	if err := t.requireNotFuture("task run", "created_at", run.CreatedAt); err != nil {
 		return err
 	}
 	if err := run.Validate(); err != nil {
@@ -509,7 +510,7 @@ func (t *Tx) CreateWorkerAttempt(ctx context.Context, a domain.WorkerAttempt) er
 	if a.UpdatedAt.IsZero() {
 		a.UpdatedAt = a.CreatedAt
 	}
-	if err := t.requireNotFuture("worker attempt", a.CreatedAt); err != nil {
+	if err := t.requireNotFuture("worker attempt", "created_at", a.CreatedAt); err != nil {
 		return err
 	}
 	if err := a.Validate(); err != nil {
@@ -679,7 +680,7 @@ func (t *Tx) CreateWorkspace(ctx context.Context, w domain.Workspace) error {
 	if w.CreatedAt.IsZero() {
 		w.CreatedAt = t.Now()
 	}
-	if err := t.requireNotFuture("workspace", w.CreatedAt); err != nil {
+	if err := t.requireNotFuture("workspace", "created_at", w.CreatedAt); err != nil {
 		return err
 	}
 	if err := w.Validate(); err != nil {

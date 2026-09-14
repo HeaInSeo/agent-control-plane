@@ -150,11 +150,21 @@ func TestSensitiveTokenMatchingIsWordBounded(t *testing.T) {
 // Redaction must not recurse without bound, and must not be bypassable by a
 // value shape the type switch does not name.
 func TestEncodeFieldsHandlesHostileShapes(t *testing.T) {
-	t.Run("cycle is a clean error", func(t *testing.T) {
-		cyclic := map[string]any{}
+	t.Run("cycle degrades rather than failing the caller", func(t *testing.T) {
+		// Erroring here would cost the caller its whole transaction, since
+		// AppendEvent propagates and SetPublishStatus appends after its
+		// UPDATE. The unencodable field is replaced instead.
+		cyclic := map[string]any{"note": "ordinary"}
 		cyclic["self"] = cyclic
-		if _, err := domain.EncodeFields(cyclic); err == nil {
-			t.Fatal("a cyclic structure was encoded")
+		encoded, err := domain.EncodeFields(cyclic)
+		if err != nil {
+			t.Fatalf("a cyclic structure should degrade, not fail: %v", err)
+		}
+		if !strings.Contains(encoded, domain.Unencodable) {
+			t.Fatalf("the cyclic field was not marked unencodable: %s", encoded)
+		}
+		if !strings.Contains(encoded, `"note":"ordinary"`) {
+			t.Fatalf("a sibling field was lost: %s", encoded)
 		}
 	})
 

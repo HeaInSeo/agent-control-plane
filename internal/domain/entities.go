@@ -228,11 +228,32 @@ func (a WorkerAttempt) Validate() error {
 	// unset struct field would otherwise store a lease that expired in year
 	// one, and the first lease-expiry check would fence the attempt out
 	// immediately. Absent is fine; present and zero is not.
-	if a.LeaseExpiresAt != nil && a.LeaseExpiresAt.IsZero() {
-		return fmt.Errorf("%w: lease_expires_at is present but zero", ErrInvalidEntity)
+	// Bounded by class, not by the single zero value. The hazard is a lease
+	// already expired at insert, and any past timestamp does that just as
+	// well as year one — there is no store method that writes these columns
+	// after insert, and worker_attempt rejects DELETE, so such an attempt
+	// could never be corrected.
+	if err := requireNotBeforeCreation(a.LeaseExpiresAt, "lease_expires_at", a.CreatedAt); err != nil {
+		return err
 	}
-	if a.LastCheckpointAt != nil && a.LastCheckpointAt.IsZero() {
-		return fmt.Errorf("%w: last_checkpoint_at is present but zero", ErrInvalidEntity)
+	if err := requireNotBeforeCreation(a.LastCheckpointAt, "last_checkpoint_at", a.CreatedAt); err != nil {
+		return err
+	}
+	return nil
+}
+
+// requireNotBeforeCreation checks an optional timestamp: absent is fine, but
+// present means real and at or after the row's creation.
+func requireNotBeforeCreation(at *time.Time, field string, created time.Time) error {
+	if at == nil {
+		return nil
+	}
+	if at.IsZero() {
+		return fmt.Errorf("%w: %s is present but zero", ErrInvalidEntity, field)
+	}
+	if !created.IsZero() && at.Before(created) {
+		return fmt.Errorf("%w: %s %s precedes created_at %s",
+			ErrInvalidEntity, field, at.UTC(), created.UTC())
 	}
 	return nil
 }

@@ -580,7 +580,7 @@ func TestBC4CrashDuringFirstMigrationIsRetryable(t *testing.T) {
 		Name:    set[0].Name,
 		SQL:     "CREATE TABLE half_applied (id INTEGER PRIMARY KEY);\nTHIS IS NOT SQL;",
 	}
-	if err := db.Migrate(ctx, broken); err == nil {
+	if err := db.MigrateForTest(ctx, broken); err == nil {
 		t.Fatal("a broken migration was reported as applied")
 	}
 	if err := db.Close(); err != nil {
