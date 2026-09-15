@@ -1,0 +1,480 @@
+package store
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"embed"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io/fs"
+	"path"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+)
+
+//go:embed migrations/*.sql
+var migrationFS embed.FS
+
+// Migration errors. All of them are terminal: the correct response to an
+// unexpected schema state is to stop, not to repair or re-create.
+var (
+	// ErrSchemaVersionUnsupported means the database was migrated by a newer
+	// build than this one. Running against it could corrupt invariants this
+	// build does not know about.
+	ErrSchemaVersionUnsupported = errors.New("database schema version is newer than this build supports")
+	// ErrMigrationChecksumMismatch means an already-applied migration's text
+	// changed. The applied schema and the source of truth have diverged.
+	ErrMigrationChecksumMismatch = errors.New("applied migration checksum mismatch")
+	// ErrMigrationHistoryDivergent means the applied versions are not a prefix
+	// of the known migrations, e.g. a version was applied that this build has
+	// never heard of, or an earlier version is missing.
+	ErrMigrationHistoryDivergent = errors.New("applied migration history is divergent")
+	// ErrMigrationsMalformed means the embedded migration set is unusable.
+	ErrMigrationsMalformed = errors.New("migration set malformed")
+)
+
+// Migration is one versioned, forward-only schema step.
+type Migration struct {
+	Version int
+	Name    string
+	SQL     string
+}
+
+// Checksum is the SHA-256 of the migration text.
+func (m Migration) Checksum() string {
+	sum := sha256.Sum256([]byte(m.SQL))
+	return hex.EncodeToString(sum[:])
+}
+
+// AppliedMigration is a recorded migration step.
+type AppliedMigration struct {
+	Version   int
+	Name      string
+	Checksum  string
+	AppliedAt time.Time
+}
+
+// Migrations returns the embedded migration set, ordered by version.
+func Migrations() ([]Migration, error) {
+	entries, err := fs.ReadDir(migrationFS, "migrations")
+	if err != nil {
+		return nil, fmt.Errorf("%w: read embedded migrations: %w", ErrMigrationsMalformed, err)
+	}
+
+	var out []Migration
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		version, name, err := parseMigrationName(e.Name())
+		if err != nil {
+			return nil, err
+		}
+		body, err := fs.ReadFile(migrationFS, path.Join("migrations", e.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("%w: read %s: %w", ErrMigrationsMalformed, e.Name(), err)
+		}
+		out = append(out, Migration{Version: version, Name: name, SQL: string(body)})
+	}
+	slices.SortFunc(out, func(a, b Migration) int { return a.Version - b.Version })
+
+	for i, m := range out {
+		if m.Version != i+1 {
+			return nil, fmt.Errorf("%w: migration versions must be contiguous from 1, found %d at position %d",
+				ErrMigrationsMalformed, m.Version, i+1)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%w: no migrations found", ErrMigrationsMalformed)
+	}
+	return out, nil
+}
+
+// parseMigrationName splits "0001_init.sql" into version 1 and name "init".
+func parseMigrationName(filename string) (int, string, error) {
+	base := strings.TrimSuffix(filename, ".sql")
+	prefix, name, ok := strings.Cut(base, "_")
+	if !ok || name == "" {
+		return 0, "", fmt.Errorf("%w: %q must be NNNN_name.sql", ErrMigrationsMalformed, filename)
+	}
+	version, err := strconv.Atoi(prefix)
+	if err != nil || version < 1 {
+		return 0, "", fmt.Errorf("%w: %q has a non-numeric version prefix", ErrMigrationsMalformed, filename)
+	}
+	return version, name, nil
+}
+
+// migrate brings the database up to the given migration set.
+//
+// It is idempotent: running it against an already-current database applies
+// nothing and instead re-verifies the recorded history, so a replay is also a
+// consistency check. Anything unexpected stops the process rather than
+// attempting a repair.
+//
+// Unexported: applying a set other than the embedded one records versions and
+// checksums that Open will reject for ever, while the contract marker is
+// stamped as current so the file still looks openable — and Open is the only
+// way to obtain a handle, so recovery would mean hand-editing the database.
+// Tests that need a custom set reach it through the test-only wrapper.
+func (db *DB) migrate(ctx context.Context, set []Migration) error {
+	if err := db.requireNoOpenTransaction(); err != nil {
+		return err
+	}
+	if db.mode == ModeReadOnly {
+		return fmt.Errorf("%w: cannot migrate", ErrReadOnly)
+	}
+	if len(set) == 0 {
+		return fmt.Errorf("%w: empty migration set", ErrMigrationsMalformed)
+	}
+
+	if err := db.bootstrap(ctx); err != nil {
+		return err
+	}
+	applied, err := db.AppliedMigrations(ctx)
+	if err != nil {
+		return err
+	}
+	if err := verifyHistory(applied, set); err != nil {
+		return err
+	}
+
+	for _, m := range set[len(applied):] {
+		if err := db.applyMigration(ctx, m); err != nil {
+			return fmt.Errorf("apply migration %04d_%s: %w", m.Version, m.Name, err)
+		}
+	}
+	// The database now implements this build's contract. This is the step
+	// that makes an older contract upgradeable rather than fatal.
+	return db.refreshContractMarker(ctx)
+}
+
+// MigrateEmbedded brings the database up to the embedded migration set.
+func (db *DB) MigrateEmbedded(ctx context.Context) error {
+	set, err := Migrations()
+	if err != nil {
+		return err
+	}
+	return db.migrate(ctx, set)
+}
+
+// dbKind is the value stored under the `db_kind` marker key. Open refuses a
+// non-empty database that does not carry it.
+const dbKind = "agent-control-plane"
+
+// dbContract is the contract version of the durable layout this build
+// implements. It is written by bootstrap and refreshed after a successful
+// migration to the full embedded set.
+const dbContract = "v0.1"
+
+// supportedContracts lists the contract versions this build can open, oldest
+// first, ending with dbContract.
+//
+// An older contract must be openable, or the first bump would brick every
+// existing database: verifyOwnMarker runs inside Open, Open is the only way
+// to obtain a *DB, and Migrate is the only thing that could rewrite the
+// marker — so refusing an older contract at open time would leave no in-tree
+// path to upgrade it, and recovery would mean hand-editing the one file this
+// package exists to protect. A newer contract is still refused: that database
+// carries invariants this build does not know.
+var supportedContracts = []string{"v0.1"}
+
+// contractSupported reports whether this build can open a database declaring
+// the given contract.
+func contractSupported(contract string) bool {
+	return slices.Contains(supportedContracts, contract)
+}
+
+// refreshContractMarker records that the database now implements this build's
+// contract. Called after the migration set has been fully applied.
+func (db *DB) refreshContractMarker(ctx context.Context) error {
+	if _, err := db.sql.ExecContext(ctx,
+		`UPDATE control_plane_meta SET value = ? WHERE key = 'db_contract'`, dbContract,
+	); err != nil {
+		return fmt.Errorf("store: refresh contract marker: %w", err)
+	}
+	return nil
+}
+
+// bootstrap creates the database identity marker and the migration ledger in a
+// single transaction, before any migration runs.
+//
+// The two must be created together. If `schema_migration` could exist without
+// the `db_kind` marker — as it could when the ledger was created on its own
+// and the marker was created by the first migration — then a crash in between
+// would leave a database with tables but no marker, which the next Open would
+// refuse as foreign. That state is unrecoverable without deleting the file,
+// which for a scheduler database means deleting the execution history.
+//
+// Creating both atomically means the only reachable states are:
+//
+//	no tables at all              -> fresh, bootstrap it
+//	marker + ledger, 0 applied    -> ours, mid-bootstrap, retry the migrations
+//	marker + ledger, N applied    -> ours, migrate forward from N
+//
+// bootstrap is idempotent, so a retry after any crash is safe.
+func (db *DB) bootstrap(ctx context.Context) error {
+	if err := db.requireNoOpenTransaction(); err != nil {
+		return err
+	}
+	if db.mode == ModeReadOnly {
+		return fmt.Errorf("%w: cannot bootstrap", ErrReadOnly)
+	}
+
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin bootstrap: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS control_plane_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) WITHOUT ROWID;`); err != nil {
+		return fmt.Errorf("store: create control_plane_meta: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO control_plane_meta (key, value) VALUES (?, ?), (?, ?)
+		 ON CONFLICT (key) DO NOTHING`,
+		"db_kind", dbKind, "db_contract", dbContract,
+	); err != nil {
+		return fmt.Errorf("store: write database identity marker: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS schema_migration (
+    version    INTEGER PRIMARY KEY CHECK (version >= 1),
+    name       TEXT NOT NULL,
+    checksum   TEXT NOT NULL,
+    applied_at TEXT NOT NULL
+) WITHOUT ROWID;`); err != nil {
+		return fmt.Errorf("store: create schema_migration: %w", err)
+	}
+
+	// A pre-existing marker must still say this database is ours. Bootstrap is
+	// never a way to take over a file Open would have refused.
+	var kind string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT value FROM control_plane_meta WHERE key = 'db_kind'`).Scan(&kind); err != nil {
+		return fmt.Errorf("store: read database identity marker: %w", err)
+	}
+	if kind != dbKind {
+		return fmt.Errorf("%w: %s declares db_kind %q", ErrForeignDatabase, db.path, kind)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit bootstrap: %w", err)
+	}
+	return nil
+}
+
+// AppliedMigrations returns the recorded migration history, ordered by version.
+//
+// A database that has never been bootstrapped has no ledger and therefore no
+// history; that is reported as an empty history rather than an error, so an
+// inspector can look at a fresh or half-bootstrapped file without failing.
+func (db *DB) AppliedMigrations(ctx context.Context) ([]AppliedMigration, error) {
+	if err := db.requireNoOpenTransaction(); err != nil {
+		return nil, err
+	}
+	hasLedger, err := db.tableExists(ctx, "schema_migration")
+	if err != nil {
+		return nil, err
+	}
+	if !hasLedger {
+		return nil, nil
+	}
+
+	rows, err := db.sql.QueryContext(ctx,
+		`SELECT version, name, checksum, applied_at FROM schema_migration ORDER BY version`)
+	if err != nil {
+		return nil, fmt.Errorf("store: read schema_migration: %w", err)
+	}
+	defer rows.Close()
+
+	var out []AppliedMigration
+	for rows.Next() {
+		var (
+			m  AppliedMigration
+			at string
+		)
+		if err := rows.Scan(&m.Version, &m.Name, &m.Checksum, &at); err != nil {
+			return nil, fmt.Errorf("store: scan schema_migration: %w", err)
+		}
+		ts, err := parseTime(at)
+		if err != nil {
+			return nil, fmt.Errorf("store: schema_migration.applied_at: %w", err)
+		}
+		m.AppliedAt = ts
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate schema_migration: %w", err)
+	}
+	return out, nil
+}
+
+// tableExists reports whether a non-internal table is present.
+func (db *DB) tableExists(ctx context.Context, name string) (bool, error) {
+	if err := db.requireNoOpenTransaction(); err != nil {
+		return false, err
+	}
+	var n int
+	if err := db.sql.QueryRowContext(ctx,
+		`SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = ?`, name,
+	).Scan(&n); err != nil {
+		return false, fmt.Errorf("store: look up table %q: %w", name, err)
+	}
+	return n > 0, nil
+}
+
+// SchemaVersion reports the highest applied migration version, or 0 for a
+// database that has never been migrated.
+func (db *DB) SchemaVersion(ctx context.Context) (int, error) {
+	applied, err := db.AppliedMigrations(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if len(applied) == 0 {
+		return 0, nil
+	}
+	return applied[len(applied)-1].Version, nil
+}
+
+// VerifySchema checks that the database's applied history matches the embedded
+// migration set exactly, without writing anything. This is the check a
+// read-only inspector or an integrity checker uses: it never migrates and
+// never advances the scheduler epoch.
+func (db *DB) VerifySchema(ctx context.Context) error {
+	set, err := Migrations()
+	if err != nil {
+		return err
+	}
+	applied, err := db.AppliedMigrations(ctx)
+	if err != nil {
+		return err
+	}
+	if err := verifyHistory(applied, set); err != nil {
+		return err
+	}
+	if len(applied) != len(set) {
+		return fmt.Errorf("%w: applied %d of %d known migrations",
+			ErrMigrationHistoryDivergent, len(applied), len(set))
+	}
+	return nil
+}
+
+// verifyHistory checks that applied is an exact prefix of set.
+//
+// A database migrated further than this build knows about is the dangerous
+// case: it fails closed with ErrSchemaVersionUnsupported rather than being
+// treated as "close enough".
+func verifyHistory(applied []AppliedMigration, set []Migration) error {
+	if len(applied) > len(set) {
+		return fmt.Errorf("%w: database at version %d, this build knows up to %d",
+			ErrSchemaVersionUnsupported, applied[len(applied)-1].Version, set[len(set)-1].Version)
+	}
+	for i, a := range applied {
+		want := set[i]
+		if a.Version != want.Version {
+			return fmt.Errorf("%w: position %d has version %d, expected %d",
+				ErrMigrationHistoryDivergent, i, a.Version, want.Version)
+		}
+		if a.Name != want.Name {
+			return fmt.Errorf("%w: version %d is recorded as %q, expected %q",
+				ErrMigrationHistoryDivergent, a.Version, a.Name, want.Name)
+		}
+		if a.Checksum != want.Checksum() {
+			return fmt.Errorf("%w: version %d recorded %s, embedded %s",
+				ErrMigrationChecksumMismatch, a.Version, a.Checksum, want.Checksum())
+		}
+	}
+	return nil
+}
+
+// applyMigration runs one migration and records it in the same transaction, so
+// a failure can never leave a half-applied step recorded as complete.
+func (db *DB) applyMigration(ctx context.Context, m Migration) error {
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Re-read the ledger inside the transaction. The version check that got
+	// us here ran outside it, so two processes starting together both see an
+	// unmigrated database — nothing fences them, since the epoch fence only
+	// begins at ActivateScheduler — and the loser's DDL would fail with an
+	// opaque "table already exists" after waiting out the winner's commit.
+	// BEGIN IMMEDIATE makes this check-then-write atomic.
+	var (
+		recordedName     string
+		recordedChecksum string
+	)
+	err = tx.QueryRowContext(ctx,
+		`SELECT name, checksum FROM schema_migration WHERE version = ?`, m.Version,
+	).Scan(&recordedName, &recordedChecksum)
+	switch {
+	case err == nil:
+		// Someone else applied it first. That is a success, provided it is
+		// the same migration: a different name or checksum means the applied
+		// schema and this build have diverged, which must still fail closed.
+		if recordedName != m.Name {
+			return fmt.Errorf("%w: version %d is recorded as %q, this build has %q",
+				ErrMigrationHistoryDivergent, m.Version, recordedName, m.Name)
+		}
+		if recordedChecksum != m.Checksum() {
+			return fmt.Errorf("%w: version %d recorded %s, embedded %s",
+				ErrMigrationChecksumMismatch, m.Version, recordedChecksum, m.Checksum())
+		}
+		return nil
+	case !errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("read ledger: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, m.SQL); err != nil {
+		return fmt.Errorf("exec: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO schema_migration (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)`,
+		m.Version, m.Name, m.Checksum(), formatTime(time.Now().UTC()),
+	); err != nil {
+		return fmt.Errorf("record: %w", err)
+	}
+	return tx.Commit()
+}
+
+// timeLayout is the stored timestamp format: RFC 3339 with nanoseconds in UTC,
+// which sorts lexicographically in the same order as chronologically.
+const timeLayout = "2006-01-02T15:04:05.000000000Z"
+
+func formatTime(t time.Time) string { return t.UTC().Format(timeLayout) }
+
+func parseTime(s string) (time.Time, error) {
+	t, err := time.Parse(timeLayout, s)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parse timestamp %q: %w", s, err)
+	}
+	return t, nil
+}
+
+func formatTimePtr(t *time.Time) any {
+	if t == nil {
+		return nil
+	}
+	return formatTime(*t)
+}
+
+func parseTimePtr(s sql.NullString) (*time.Time, error) {
+	if !s.Valid || s.String == "" {
+		return nil, nil
+	}
+	t, err := parseTime(s.String)
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
