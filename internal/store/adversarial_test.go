@@ -1124,7 +1124,7 @@ func TestPublishPreconditionsRejectStaleBinding(t *testing.T) {
 		AttemptStatus:         state.AttemptVerifying,
 		AttemptFenceEpoch:     f.Attempt.FenceEpoch,
 		WorkspaceAttemptID:    f.Attempt.AttemptID,
-		WorkspaceReleased:     false,
+		WorkspaceLive:         true,
 		RepositorySubjectID:   f.Subject.RepositorySubjectID,
 		CommitInWorkspace:     true,
 		TaskStatus:            state.TaskRunning,
@@ -1158,7 +1158,7 @@ func TestPublishPreconditionsRejectStaleBinding(t *testing.T) {
 			return p
 		},
 		"workspace was released": func(p domain.PublishPreconditions) domain.PublishPreconditions {
-			p.WorkspaceReleased = true
+			p.WorkspaceLive = false
 			return p
 		},
 		"repository subject changed": func(p domain.PublishPreconditions) domain.PublishPreconditions {
@@ -1415,7 +1415,7 @@ func TestReleasingAWorkspaceIsAllowedButDoesNotRebindIt(t *testing.T) {
 		AttemptStatus:         state.AttemptVerifying,
 		AttemptFenceEpoch:     f.Attempt.FenceEpoch,
 		WorkspaceAttemptID:    f.Attempt.AttemptID,
-		WorkspaceReleased:     true,
+		WorkspaceLive:         false,
 		RepositorySubjectID:   f.Subject.RepositorySubjectID,
 		CommitInWorkspace:     true,
 	}

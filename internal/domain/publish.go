@@ -232,9 +232,14 @@ type PublishPreconditions struct {
 	AttemptStatus         state.WorkerAttemptStatus
 	AttemptFenceEpoch     FenceEpoch
 	WorkspaceAttemptID    ids.AttemptID
-	WorkspaceReleased     bool
-	RepositorySubjectID   ids.RepositorySubjectID
-	CommitInWorkspace     bool
+	// WorkspaceLive rather than WorkspaceReleased, so the zero value fails
+	// closed like every other field here. "Released: false" meant "the
+	// workspace is live", so a caller building this struct incrementally, or
+	// omitting the field, got a pass on the released-workspace check and
+	// would have published from a stale tree.
+	WorkspaceLive       bool
+	RepositorySubjectID ids.RepositorySubjectID
+	CommitInWorkspace   bool
 
 	// TaskStatus is the scheduling state of the task being published for. A
 	// withdrawn task must not have its push go out: nothing else in the gate
@@ -298,8 +303,8 @@ func CheckPublishPreconditions(p PublishAttempt, live PublishPreconditions) erro
 			ErrPublishBindingInvalid, string(p.WorkspaceID),
 			string(live.WorkspaceAttemptID), string(p.AttemptID))
 	}
-	if live.WorkspaceReleased {
-		return fmt.Errorf("%w: workspace %s is released; a stale workspace cannot be published",
+	if !live.WorkspaceLive {
+		return fmt.Errorf("%w: workspace %s is not live; a stale workspace cannot be published",
 			ErrPublishBindingInvalid, string(p.WorkspaceID))
 	}
 	if live.RepositorySubjectID != p.RepositorySubjectID {

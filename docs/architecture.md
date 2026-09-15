@@ -303,6 +303,17 @@ it while the approved effect is no longer the state of the ref. A future effect
 that legitimately transforms commits — a merge-generated commit, say — needs
 its own explicit evidence contract with provenance, not a loosened default.
 
+Completion is enforced in the schema as well as in Go. A trigger re-derives
+it on any write of `status` or `completed_evidence_id`: the evidence must come
+from the task's current attempt, that attempt must be live and under the
+current generation with an unreleased workspace, observed and published SHAs
+must match exactly, modifying work needs an applied or observed publication,
+and read-only work needs review evidence. Every sibling fence was already
+mirrored in a trigger; completion was the one that was not, so a raw `UPDATE`
+could mark a task COMPLETED with no publication at all — permanently, since
+`task_run` rejects `DELETE` and the binding freezes once set. That is the I1
+invariant, so it does not rest on code remembering.
+
 Completion additionally requires that the evidence come from the attempt that
 currently owns the task, that the attempt is not terminal, that its workspace
 has not been released, and that the attempt's scheduler epoch is current.
@@ -489,6 +500,12 @@ the stored value, so a misrouted identifier is a compile error in code and
 detectable in data. Event order identity is `(scheduler_epoch, seq)`, a
 composite primary key, with `seq` allocated by the store inside the appending
 transaction.
+
+`event.fields` must be a JSON object, not merely valid JSON. `json_valid`
+accepts `[1,2,3]` and `42`, and one such row would make every read of that
+epoch fail to decode — for ever, since the table rejects `UPDATE` and
+`DELETE`, so replay for that scheduler generation would be dead. The packet
+scope columns are checked as arrays for the same reason.
 
 History reads page on `(epoch, seq)` rather than an offset, so a page boundary
 cannot shift under a concurrent append: `seq` is monotonic within an epoch and

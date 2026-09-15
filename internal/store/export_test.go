@@ -121,3 +121,10 @@ func (t *Tx) QueryPlanForTest(ctx context.Context, query string, args ...any) (s
 func (db *DB) MigrateForTest(ctx context.Context, set []Migration) error {
 	return db.migrate(ctx, set)
 }
+
+// RunIntegrityCheckForTest runs an arbitrary pragma through the integrity
+// check path, so a test can prove that a result set without a single "ok"
+// row is treated as a failure rather than a pass.
+func (db *DB) RunIntegrityCheckForTest(ctx context.Context, pragma string) error {
+	return db.runIntegrityCheck(ctx, pragma)
+}

@@ -474,12 +474,16 @@ func (db *DB) runIntegrityCheck(ctx context.Context, pragma string) error {
 	}
 	defer rows.Close()
 
-	var problems []string
+	var (
+		problems []string
+		seen     int
+	)
 	for rows.Next() {
 		var line string
 		if err := rows.Scan(&line); err != nil {
 			return fmt.Errorf("%w: %w", ErrIntegrityCheckFailed, err)
 		}
+		seen++
 		if line != "ok" {
 			problems = append(problems, line)
 		}
@@ -489,6 +493,14 @@ func (db *DB) runIntegrityCheck(ctx context.Context, pragma string) error {
 	}
 	if len(problems) > 0 {
 		return fmt.Errorf("%w: %s: %v", ErrIntegrityCheckFailed, db.path, problems)
+	}
+	// Exactly one row, and it said ok. Accepting zero rows was fail-open in
+	// the one check that decides whether a corrupt scheduler database is
+	// opened: SQLite returns an empty result set, with no error, for a pragma
+	// it does not recognise.
+	if seen != 1 {
+		return fmt.Errorf("%w: %s: %q returned %d rows, want exactly 1",
+			ErrIntegrityCheckFailed, db.path, pragma, seen)
 	}
 	return nil
 }

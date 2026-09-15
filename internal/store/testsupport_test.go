@@ -290,7 +290,7 @@ func fixtureForPreconditions() preconditionFixture {
 			AttemptStatus:         state.AttemptVerifying,
 			AttemptFenceEpoch:     1,
 			WorkspaceAttemptID:    attemptID,
-			WorkspaceReleased:     false,
+			WorkspaceLive:         true,
 			RepositorySubjectID:   subjectID,
 			CommitInWorkspace:     true,
 			TaskStatus:            state.TaskRunning,

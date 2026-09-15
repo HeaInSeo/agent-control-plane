@@ -139,9 +139,9 @@ CREATE TABLE execution_packet (
 
     -- JSON arrays. An empty allowed_scope is rejected: an empty closed world
     -- authorises nothing, and must never be read as "unbounded".
-    allowed_scope         TEXT NOT NULL CHECK (json_valid(allowed_scope) AND json_array_length(allowed_scope) > 0),
-    forbidden_scope       TEXT NOT NULL CHECK (json_valid(forbidden_scope)),
-    stop_conditions       TEXT NOT NULL CHECK (json_valid(stop_conditions)),
+    allowed_scope         TEXT NOT NULL CHECK (json_valid(allowed_scope) AND json_type(allowed_scope) = 'array' AND json_array_length(allowed_scope) > 0),
+    forbidden_scope       TEXT NOT NULL CHECK (json_valid(forbidden_scope) AND json_type(forbidden_scope) = 'array'),
+    stop_conditions       TEXT NOT NULL CHECK (json_valid(stop_conditions) AND json_type(stop_conditions) = 'array'),
     acceptance_contract   TEXT NOT NULL CHECK (length(acceptance_contract) > 0),
 
     status                TEXT NOT NULL CHECK (status IN ('APPROVED', 'STALE', 'SUPERSEDED'))
@@ -255,6 +255,52 @@ WHEN (SELECT task_id FROM execution_packet WHERE packet_id = NEW.packet_id) IS N
   OR (SELECT intent FROM execution_packet WHERE packet_id = NEW.packet_id) IS NOT NEW.intent
 BEGIN
     SELECT RAISE(ABORT, 'task_run identity must match its execution_packet');
+END;
+
+-- Completion must be derivable from the evidence it names, in the schema and
+-- not only in Go. CompleteTaskRunFromEvidence enforces all of this, but a raw
+-- UPDATE bypassed it entirely: a task could be marked COMPLETED on a
+-- fenced-out attempt's evidence, or with no publication at all, which is the
+-- I1 invariant this control plane advertises. Every sibling fence is mirrored
+-- in a trigger; completion was the one that was not.
+--
+-- task_run rejects DELETE and the completion binding is frozen once set, so a
+-- bad completion would have been permanent.
+CREATE TRIGGER trg_task_run_completion_is_derivable
+BEFORE UPDATE OF status, completed_evidence_id ON task_run
+FOR EACH ROW
+WHEN NEW.status = 'COMPLETED'
+ AND (
+        -- The evidence must come from the attempt that currently owns the task.
+        NEW.completed_evidence_id IS NULL
+     OR (SELECT attempt_id FROM evidence_observation WHERE evidence_id = NEW.completed_evidence_id)
+        IS NOT NEW.current_attempt_id
+        -- That attempt must be live, under the current generation, with an
+        -- unreleased workspace.
+     OR (SELECT status FROM worker_attempt WHERE attempt_id = NEW.current_attempt_id)
+        IN ('FAILED', 'ABANDONED', 'EVIDENCE_UNKNOWN')
+     OR (SELECT scheduler_epoch FROM worker_attempt WHERE attempt_id = NEW.current_attempt_id)
+        IS NOT (SELECT current_epoch FROM scheduler_ownership WHERE id = 1)
+     OR (SELECT released_at FROM workspace WHERE attempt_id = NEW.current_attempt_id) IS NOT NULL
+        -- The default repository-effect rule: observed == published exactly.
+     OR (SELECT observed_sha FROM evidence_observation WHERE evidence_id = NEW.completed_evidence_id)
+        IS NOT (SELECT published_sha FROM evidence_observation WHERE evidence_id = NEW.completed_evidence_id)
+        -- Modifying work needs an applied or observed publication; read-only
+        -- work needs review evidence and no publication.
+     OR (NEW.intent = 'MODIFYING' AND (
+              (SELECT publish_attempt_id FROM evidence_observation WHERE evidence_id = NEW.completed_evidence_id) IS NULL
+           OR (SELECT evidence_kind FROM evidence_observation WHERE evidence_id = NEW.completed_evidence_id) = 'READ_ONLY_REVIEW'
+           OR (SELECT status FROM publish_attempt
+                WHERE publish_attempt_id = (SELECT publish_attempt_id FROM evidence_observation
+                                             WHERE evidence_id = NEW.completed_evidence_id))
+              NOT IN ('APPLIED', 'OBSERVED')
+        ))
+     OR (NEW.intent = 'READ_ONLY' AND
+          (SELECT evidence_kind FROM evidence_observation WHERE evidence_id = NEW.completed_evidence_id)
+          IS NOT 'READ_ONLY_REVIEW')
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'completion must be derivable from the evidence it names');
 END;
 
 -- Completion evidence must be evidence about this very task.
@@ -1041,7 +1087,12 @@ CREATE TABLE event (
     -- event into a table that rejects UPDATE and DELETE.
     task_id         TEXT REFERENCES task_run (task_id),
     attempt_id      TEXT REFERENCES worker_attempt (attempt_id),
-    fields          TEXT NOT NULL CHECK (json_valid(fields)),
+    -- An object, not merely valid JSON: json_valid accepts '[1,2,3]' and '42',
+    -- and one such row makes every read of that epoch fail to decode — for
+    -- ever, since event rejects UPDATE and DELETE, so replay for that
+    -- scheduler generation would be dead. EncodeFields always emits an
+    -- object, so the column says so.
+    fields          TEXT NOT NULL CHECK (json_valid(fields) AND json_type(fields) = 'object'),
     PRIMARY KEY (scheduler_epoch, seq)
 ) WITHOUT ROWID;
 

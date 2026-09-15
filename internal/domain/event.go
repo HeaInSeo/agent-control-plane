@@ -241,7 +241,10 @@ const maxRedactionDepth = 64
 // arrive here as plain maps, slices and scalars.
 func redactValue(v any, depth int) any {
 	if depth > maxRedactionDepth {
-		return Redacted
+		// Unencodable rather than Redacted: past the cap the value was never
+		// inspected, which is what that marker documents. It is not known to
+		// be a credential.
+		return Unencodable
 	}
 	switch typed := v.(type) {
 	case map[string]any:

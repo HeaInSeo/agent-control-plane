@@ -177,6 +177,13 @@ func (t *Tx) CreateTaskRun(ctx context.Context, run domain.TaskRun) error {
 	if err := t.requireNotFuture("task run", "created_at", run.CreatedAt); err != nil {
 		return err
 	}
+	// The second timestamp too. monotonicNow clamps every later update up to
+	// whatever updated_at holds, so a future-dated one leaves the row
+	// claiming it changed in the future — and task_run rejects DELETE with
+	// created_at frozen, so that claim is uncorrectable.
+	if err := t.requireNotFuture("task run", "updated_at", run.UpdatedAt); err != nil {
+		return err
+	}
 	if err := run.Validate(); err != nil {
 		return err
 	}
@@ -512,6 +519,25 @@ func (t *Tx) CreateWorkerAttempt(ctx context.Context, a domain.WorkerAttempt) er
 	}
 	if err := t.requireNotFuture("worker attempt", "created_at", a.CreatedAt); err != nil {
 		return err
+	}
+	if err := t.requireNotFuture("worker attempt", "updated_at", a.UpdatedAt); err != nil {
+		return err
+	}
+	// A lease already expired against real time is the hazard the entity
+	// guard names, and comparing it to created_at does not catch it: a
+	// created_at an hour in the past admits a lease half an hour in the
+	// past. Nothing writes this column after insert and worker_attempt
+	// rejects DELETE, so such an attempt could never be corrected.
+	if a.LeaseExpiresAt != nil {
+		if now := t.Now(); a.LeaseExpiresAt.Before(now) {
+			return fmt.Errorf("%w: worker attempt lease_expires_at %s has already passed (now %s)",
+				domain.ErrInvalidEntity, a.LeaseExpiresAt.UTC(), now.UTC())
+		}
+	}
+	if a.LastCheckpointAt != nil {
+		if err := t.requireNotFuture("worker attempt", "last_checkpoint_at", *a.LastCheckpointAt); err != nil {
+			return err
+		}
 	}
 	if err := a.Validate(); err != nil {
 		return err
